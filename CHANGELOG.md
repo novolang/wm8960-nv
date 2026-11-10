@@ -40,9 +40,6 @@ I2S handle.
   every line of `src/`.
 - The device program `examples/playback.nv`. Built for the nRF52840-DK it is
   14,108 B of flash and for the nRF54LM20-DK 15,436 B.
-- `workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot)`:
-  `gain_set` compares the path where a `match` over `CodecPath` would fail IR
-  verification.
 
 ### Known
 

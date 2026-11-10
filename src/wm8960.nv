@@ -746,10 +746,9 @@ fn in_zc(c: Wm8960Config) -> Int
 // largest step at or below `g`.  The gain set, or `None` when `g` is below the
 // path's range or the part did not take it.
 pub fn gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, path: CodecPath, g: MilliDb) -> ?MilliDb [hw, mutate]
-    // workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot): a match over CodecPath with ?MilliDb arms fails IR verification, so the path is compared.
-    if path == CodecPath.CodecOutput
-        return out_gain_set(p, c, g)
-    in_gain_set(p, c, g)
+    match path
+        CodecPath.CodecOutput => out_gain_set(p, c, g)
+        CodecPath.CodecInput => in_gain_set(p, c, g)
 
 fn out_gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
     let Some(code) = out_code(g) else return None
