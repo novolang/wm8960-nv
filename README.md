@@ -99,21 +99,29 @@ probe-rs run --chip nRF52840_xxAA main.elf
 
 | Image | Flash | Of which program | RAM (`.data` and `.bss`) |
 |---|---|---|---|
-| `nrf52840-dk` | 14,108 B | 2,032 B | 3,172 B |
-| `nrf54lm20-dk` | 15,436 B | 2,358 B | 3,172 B |
+| `nrf52840-dk` | 20,032 B | 4,694 B | 3,764 B |
+| `nrf54lm20-dk` | 21,392 B | 5,056 B | 3,764 B |
 
 The numbers are from the build's memory report. Flash also holds the
 runtime, the compiler's support library and the program's tables. The RAM
 figure includes the driver's shadow of the registers, 64 words. The arena is
 the runtime's heap and is reserved whether or not the program uses it.
 
-**The I2S block and the I2C bus are absent hardware on both boards.**
+**The I2S block is absent hardware on both boards; the I2C bus is not.**
 embedded-hal-nv has a trait for an I2S interface and no board handle for
-one, and neither Nordic board package drives its I2S block or its two-wire
-interface. The program is written against the `I2s` trait and is given
-`NoI2s`, so on both images `begin` answers `false` and the program prints
-`no answer from the codec at 0x1A`. The one argument of `attach` is what
-changes when a board package gives a handle.
+one, and neither Nordic board package drives its I2S block.  The Nordic DKs
+drive the control port's I2C with a TWIM (the nRF52840 DK's TWIM0 on SDA
+P0.26 and SCL P0.27, the nRF54LM20 DK's TWIM22 on SDA P1.03 and SCL P1.04),
+on the pins `docs/hal/README.md` names under "The Nordic DKs' buses", so
+both images carry the driver's reading path.  Before the Nordic buses landed
+the two rows were 14,108 and 15,436 bytes of flash, of which the program was
+2,032 and 2,358 bytes, and 3,172 bytes of RAM, because the board packages
+answered for I2C as absent hardware and the build removed the code that
+follows the first bus read.  The program is written against the `I2s` trait
+and is given `NoI2s`, so on both images `begin` answers `false` and the
+program prints `no answer from the codec at 0x1A`.  A reply from the codec
+over a DK's bus is NOT VERIFIED until the driver rig carries one.  The one
+argument of `attach` is what changes when a board package gives a handle.
 
 ### The effects
 

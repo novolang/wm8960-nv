@@ -39,13 +39,16 @@ I2S handle.
 - The suite runs over a double of the part and of the I2S handle and covers
   every line of `src/`.
 - The device program `examples/playback.nv`. Built for the nRF52840-DK it is
-  14,108 B of flash and for the nRF54LM20-DK 15,436 B.
+  20,032 B of flash and for the nRF54LM20-DK 21,392 B; before the Nordic buses
+  landed, with the reading path left out, it was 14,108 B and 15,436 B.
 
 ### Known
 
 - Hardware verification: NOT VERIFIED. No board carries a WM8960, and no
-  board package has an I2S block or, on the Nordic boards, an I2C driver. The
-  device program is given a stand-in handle and finds an absent bus.
+  board package has an I2S block. The Nordic DKs drive I2C with TWIM0 and
+  TWIM22, so the device program's images carry the reading path; a reply from
+  the codec over either bus is NOT VERIFIED. The device program is given a
+  stand-in handle.
 - Rev 4.4 of the data sheet holds no power-up or anti-pop sequence. The order
   is from the bits' descriptions and the Linux and Zephyr drivers; the waits
   (100 ms for VMID, 250 ms for the PLL, 600 ms for the headphone discharge,
