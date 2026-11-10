@@ -1,0 +1,32 @@
+[package]
+name        = "wm8960-nv"
+version     = "0.1.0"
+description = "A driver for Cirrus Logic's WM8960 stereo audio codec with headphone and class-D speaker drivers, on an I2C control bus and a board's I2S handle: the write-only 9-bit registers kept in a shadow, the PLL from MCLK with the data sheet's fractional formula, the dividers and the audio interface, the input and output paths with the volume update and zero-cross bits, and the bias and power sequence in the data sheet's order, as devices-nv's AudioCodec."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "embedded"
+layer       = "host"
+tags        = ["wm8960", "cirrus", "wolfson", "codec", "audio", "dac", "adc", "class-d", "i2s", "i2c", "nrf52840-dk", "nrf54lm20-dk"]
+repository  = "https://github.com/novolang/wm8960-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+[docs.pages]
+"README.md" = "Playing and recording sound through a WM8960 codec"
+
+# Every module of the package checks at the embedded tier, so a program
+# of any tier, embedded, rt or system, may call it.
+[tier]
+tier = "embedded"
+
+# The device program, examples/playback.nv, has no [[bin]] entry: an entry
+# makes the registry list the package as a program.  tests/device_build.sh
+# builds the program for two boards as the main of a scratch package that
+# depends on this one.
+
+[dependencies]
+# The board's I2C handle, the I2cBus, Timer and I2s traits and the I2S
+# settings.
+embedded-hal-nv = { path = "../embedded-hal-nv" }
+# The wiring record, the register helpers, and the AudioCodec trait.
+devices-nv      = { path = "../devices-nv" }

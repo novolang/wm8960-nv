@@ -1,0 +1,1017 @@
+// wm8960 — Cirrus Logic's (Wolfson's) WM8960, a stereo codec with
+// headphone and class-D speaker drivers, an I2C control port and an I2S
+// audio port, as devices-nv's `AudioCodec`.
+//
+// The facts below are from Cirrus Logic's data sheet "WM8960: Stereo CODEC
+// with 1W Stereo Class-D Speaker Drivers and Headphone Drivers for Portable
+// Audio Applications", Rev 4.4, January 2019 (the copy mirrored at
+// e2e.ti.com), whose register map, tables and clock formulas are named by
+// number.  Rev 4.4 lists "Applications Information" but holds no power-up
+// or anti-pop sequence, only the bits of the anti-pop registers and the
+// advice to enable and disable the functions "in the correct order"; the
+// order in `step_bias_up` and `step_power_down` is taken from the bits'
+// descriptions and from the Linux kernel's `sound/soc/codecs/wm8960.c`,
+// read for its fixes and not ported, and Zephyr's NXP
+// `drivers/audio/wm8960.c`, read the same way.
+//
+// The control port (data sheet, "2-Wire Serial Control Interface").  The
+// device address is 0011010, 0x1A as a seven-bit address (the data sheet
+// prints it with the write bit as 0x34).  A write is two bytes: the seven
+// bits of the register number then the ninth (top) data bit, then the low
+// eight data bits.  The registers are write-only: nothing can be read back.
+// So the driver keeps a shadow of the 56 registers, 9 bits each, starts it
+// from the data sheet's reset values when the part is reset, and updates a
+// field by writing the shadow's other bits with it.  The volume update bits
+// (the top bit of the volume registers) are not state: the shadow never keeps
+// them.
+//
+// The shadow is module state, because `AudioCodec` gives a method a plain
+// `self` and a `self` cannot change a field.  It follows that the module
+// holds the state of one WM8960 per program.  `shadow_reset` empties it and
+// `begin` fills it.
+//
+// The clock (data sheet, "Clocking and Sample Rates").  SYSCLK is MCLK
+// (optionally divided by 2) or the output of a PLL.  The ADC and DAC
+// sample rate is SYSCLK / (256 x d) with d one of 1, 1.5, 2, 3, 4, 5.5, 6.
+// The PLL multiplies MCLK, halved first when the ratio would be below 6,
+// by R = N.K, with a fixed divide by 4 and a post-divide by 2 (SYSCLKDIV):
+//
+//     f2 = 4 x 2 x SYSCLK = 8 x SYSCLK;   R = f2 / f1;
+//     N = int R, 6 to 12;                K = int(2^24 x (R - N))
+//
+// f1 is MCLK, or MCLK / 2 with PLLPRESCALE.  For 12 MHz to 11.2896 MHz
+// R is 7.5264, N 7 and K 0x86C226.  The data sheet's worked example for
+// 12 MHz to 12.288 MHz prints K as 3221225 = 0x3126E9, and its Table 45
+// prints 0x3126E8 for the same row; several rows of Table 45 differ from
+// the formula by one in the last digit.  This driver computes the
+// formula, so the PLL it programs is within one count of the table's.
+// The class-D clock is SYSCLK / DCLKDIV and the data sheet asks for 700 to
+// 800 kHz, 768 kHz best, with `SPK_OP_EN` set only after SYSCLK runs.
+//
+// The power-up order (the bits of R25 to R29 and R47, and the reference
+// drivers).  The anti-pop registers: with POBCTRL, SOFT_ST, BUFDCOPEN and
+// BUFIOEN set, VMID is enabled as a 2 x 50k divider and given 100 ms to
+// ramp, then VREF is enabled, then the anti-pop bits go back to BUFIOEN
+// alone.  Then the DAC's soft mute is set, the output mixers and the DAC
+// come on, and last the output drivers.  The class-D outputs come on only
+// when the clock for them is valid.  Power-down is the reverse.
+//
+// Disagreements and faults in the reference drivers, and what was taken:
+//   * Linux's capless bias path "disables anti-pop features" by writing the
+//     bits it means to clear with the mask and value both set, so they stay
+//     on; here the anti-pop bits go to BUFIOEN alone.
+//   * Zephyr's power-up writes VMIDSEL = 11 (2 x 5k, fast start-up) together
+//     with VREF and never moves to the playback divider, which the data sheet
+//     gives as 2 x 50k (01); its names for the divider values are wrong.
+//     Here VMID is 2 x 50k.
+//   * Zephyr's "clear anti-pop" sets the bits (BUFDCOPEN, SOFT_ST, BUFIOEN,
+//     DISOP and DRES); here none of the discharge bits is left on.
+//   * The PLL lock time.  Linux waits 250 ms after enabling the PLL before
+//     selecting it; Zephyr waits 10 ms.  The data sheet gives none.  The
+//     longer wait is taken.
+//   * The volume update.  The data sheet writes the left volume with the
+//     update bit clear and the right with it set (Figure 16), so both change
+//     together; the functions here do the same.
+
+use embedded_hal.{ BoardI2c, BoardTimer, I2cBus, Timer, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+
+// The registers.
+let R_LINVOL  = 0x00
+let R_RINVOL  = 0x01
+let R_LOUT1   = 0x02
+let R_ROUT1   = 0x03
+let R_CLOCK1  = 0x04
+let R_DACCTL1 = 0x05
+let R_IFACE1  = 0x07
+let R_IFACE2  = 0x09
+let R_CLOCK2  = 0x08
+let R_LDAC    = 0x0A
+let R_RDAC    = 0x0B
+let R_RESET   = 0x0F
+let R_LADC    = 0x15
+let R_RADC    = 0x16
+let R_ADDCTL1 = 0x17
+let R_POWER1  = 0x19
+let R_POWER2  = 0x1A
+let R_APOP1   = 0x1C
+let R_APOP2   = 0x1D
+let R_LINPATH = 0x20
+let R_RINPATH = 0x21
+let R_LOUTMIX = 0x22
+let R_ROUTMIX = 0x25
+let R_LOUT2   = 0x28
+let R_ROUT2   = 0x29
+let R_POWER3  = 0x2F
+let R_ADDCTL4 = 0x30
+let R_CLASSD1 = 0x31
+let R_CLASSD3 = 0x33
+let R_PLL1    = 0x34
+let R_PLL2    = 0x35
+let R_PLL3    = 0x36
+let R_PLL4    = 0x37
+
+// The number of registers, and the shadow's layout: the registers, then
+// three flags.
+let REG_COUNT  = 56
+let SH_LEN     = 64
+let SH_FORMAT  = 56
+let SH_DISCH   = 57
+
+// Bits.
+let VU          = 0x100
+let INMUTE      = 0x80
+let ZC          = 0x80
+let INZC        = 0x40
+let DACMU       = 0x08
+let PLL_EN      = 0x001
+let CLKSEL      = 0x001
+let VREF        = 0x040
+let VMID_MASK   = 0x180
+let VMID_50K    = 0x080
+let APOP1_ON    = 0x9C
+let APOP1_IDLE  = 0x08
+let LD2LO       = 0x100
+let RD2RO       = 0x100
+let PWR3_MIX    = 0x00C
+let PWR3_MIC    = 0x030
+let PWR1_INPUT  = 0x03E
+let PWR2_DAC    = 0x180
+let PWR2_HP     = 0x060
+let PWR2_SPK    = 0x018
+let SPK_OP_MASK = 0x0C0
+let SPK_OP_BOTH = 0x0C0
+let TOEN        = 0x001
+
+// The I2C clock `setup` asks for: fast mode.
+let I2C_HZ = 400000
+
+// The waits, in milliseconds: the reset (Zephyr: 100), the VMID ramp
+// (Linux and Zephyr: 100), the PLL lock (Linux: 250), the headphone
+// capacitors' discharge before a power-up that follows a power-down
+// (Linux: 600).
+let RESET_MS     = 100
+let VMID_MS      = 100
+let PLL_MS       = 250
+let DISCHARGE_MS = 600
+
+// The 7-bit address, and the class-D clock window in hertz.
+let ADDR_WM8960 = 0x1A
+let DCLK_MIN_HZ = 700000
+let DCLK_MAX_HZ = 800000
+let DCLK_BEST_HZ = 768000
+
+// The data sheet's reset values of R0 to R55 (Register Map).
+const DEFAULTS = [
+    0x097, 0x097, 0x000, 0x000, 0x000, 0x008, 0x000, 0x00A,
+    0x1C0, 0x000, 0x0FF, 0x0FF, 0x000, 0x000, 0x000, 0x000,
+    0x000, 0x07B, 0x100, 0x032, 0x000, 0x0C3, 0x0C3, 0x1C0,
+    0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000,
+    0x100, 0x100, 0x050, 0x050, 0x050, 0x050, 0x000, 0x000,
+    0x000, 0x000, 0x040, 0x000, 0x000, 0x050, 0x050, 0x000,
+    0x002, 0x037, 0x04D, 0x080, 0x008, 0x031, 0x026, 0x0E9]
+
+// What a program says about how the codec is clocked and wired.
+//
+// `mclk_hz` is the master clock the board gives. `headphone` and `speaker`
+// are the output drivers to power, `microphone` the input path (the PGAs,
+// the ADCs and the microphone bias), and `zero_cross` whether volume
+// changes wait for a zero crossing, with the timeout that goes with it.
+pub @value
+struct Wm8960Config
+    mclk_hz: Int
+    headphone: Bool
+    speaker: Bool
+    microphone: Bool
+    zero_cross: Bool
+
+// A board with a master clock of `mclk_hz` and everything powered: both
+// output drivers, the microphone path, zero-cross volume updates.
+pub fn config_default(mclk_hz: Int) -> Wm8960Config
+    Wm8960Config { mclk_hz: mclk_hz, headphone: true, speaker: true, microphone: true,
+                   zero_cross: true }
+
+// The control port: the I2C bus the codec is on.  `setup` makes the bus
+// ready and answers whether the wiring suits it, `write_reg` sends the
+// 9-bit value `v` of register `r` as one two-byte transaction and answers
+// whether the part acknowledged, and `pause_ms` waits.
+pub trait Wm8960Port
+    fn setup(self) -> Bool [hw]
+    fn write_reg(self, r: Int, v: Int) -> Bool [hw]
+    fn pause_ms(self, ms: Int) [hw]
+
+// ── The bus ──────────────────────────────────────────────────────────
+
+// The first byte of a register write: the register number in bits 7 to 1
+// and the data's ninth bit in bit 0.
+pub fn word_hi(r: Int, v: Int) -> Int
+    ((r & 0x7F) << 1) | ((v >> 8) & 1)
+
+// The second byte: the data's low eight bits.
+pub fn word_lo(v: Int) -> Int
+    v & 0xFF
+
+// Writes the 9-bit value `v` to register `r` in one I2C transaction of two
+// bytes: whether the part acknowledged.
+pub fn i2c_write<B: I2cBus>(bus: B, w: DeviceWiring, r: Int, v: Int) -> Bool [hw]
+    var src: DevBytes = Vec.new()
+    let _ = src.push(word_lo(v) as u8)
+    dev_bus.wiring_write_from(bus, w, word_hi(r, v), src)
+
+// Makes the bus ready at 400 kHz and answers whether the wiring has an
+// address.
+pub fn i2c_setup<B: I2cBus>(bus: B, w: DeviceWiring) -> Bool [hw]
+    bus.init(I2C_HZ)
+    w.addr != None
+
+// ── The shadow ───────────────────────────────────────────────────────
+
+var sh: Vec[Int; 64] = Vec.new()
+
+// Fills the shadow with the data sheet's reset values and clears the
+// flags.
+pub fn shadow_reset() [mutate]
+    sh.clear()
+    for i in 0..REG_COUNT
+        let _ = sh.push(reset_value(i))
+    for _i in REG_COUNT..SH_LEN
+        let _ = sh.push(0)
+
+// Empties the shadow: the driver then knows nothing of the part.
+pub fn shadow_clear() [mutate]
+    sh.clear()
+
+// Whether the shadow holds a state.
+pub fn shadow_ready() -> Bool [mutate]
+    sh.len() == SH_LEN
+
+// The data sheet's reset value of register `r`, or -1 for a number that is
+// not a register.
+pub fn reset_value(r: Int) -> Int
+    if r < 0 or r >= REG_COUNT
+        return -1
+    DEFAULTS[r]
+
+// The shadow's value of register `r`, or -1 when the shadow is empty or `r`
+// is not a register.
+pub fn shadow_get(r: Int) -> Int [mutate]
+    if not shadow_ready() or r < 0 or r >= REG_COUNT
+        return -1
+    sh[r]
+
+// Whether register `r` has an update bit at the top, which is an action and
+// not state.
+fn is_vu(r: Int) -> Bool
+    r == R_LINVOL or r == R_RINVOL or r == R_LOUT1 or r == R_ROUT1 or r == R_LDAC or r == R_RDAC or r == R_LADC or r == R_RADC or r == R_LOUT2 or r == R_ROUT2
+
+fn shadow_flag(i: Int) -> Int [mutate]
+    if not shadow_ready()
+        return 0
+    sh[i]
+
+fn shadow_flag_set(i: Int, v: Int) [mutate]
+    if shadow_ready()
+        sh[i] = v
+
+// ── Registers ────────────────────────────────────────────────────────
+
+// Writes the 9-bit value `v` to register `r` and keeps it in the shadow
+// without the update bit: whether the part acknowledged.  A write to a
+// number that is not a register is refused without a transaction.
+pub fn reg_write<P: Wm8960Port>(p: P, r: Int, v: Int) -> Bool [hw, mutate]
+    if r < 0 or r >= REG_COUNT
+        return false
+    let x = v & 0x1FF
+    if not p.write_reg(r, x)
+        return false
+    if shadow_ready()
+        var kept = x
+        if is_vu(r)
+            kept = x & 0xFF
+        sh[r] = kept
+    true
+
+// Sets the bits of `mask` in register `r` to the bits of `bits`, the others
+// from the shadow: whether the part took it.  False without a transaction
+// while the shadow is empty.
+pub fn reg_update<P: Wm8960Port>(p: P, r: Int, mask: Int, bits: Int) -> Bool [hw, mutate]
+    let cur = shadow_get(r)
+    if cur < 0
+        return false
+    reg_write(p, r, (cur & (0x1FF ^ mask)) | (bits & mask))
+
+// ── The clock ────────────────────────────────────────────────────────
+
+// How the clocks are made for a format: whether the PLL is used, its
+// prescale (1 or 2), N and K, SYSCLKDIV's code (0 or 2), the ADC and DAC
+// divider code, SYSCLK in hertz, the class-D divider code, and the BCLK
+// divider code (-1 when the bit clock is not a whole division).
+pub @value
+struct ClockPlan
+    pll: Bool
+    prescale: Int
+    n: Int
+    k: Int
+    sysdiv: Int
+    adcdiv: Int
+    sysclk: Int
+    dclkdiv: Int
+    bclkdiv: Int
+
+// The SYSCLK a sample rate is made from: 12.288 MHz for 8, 12, 16, 24, 32
+// and 48 kHz, 11.2896 MHz for 11.025, 22.05 and 44.1 kHz, or 0.
+pub fn sysclk_of(rate: Int) -> Int
+    if rate == 8000 or rate == 12000 or rate == 16000 or rate == 24000 or rate == 32000 or rate == 48000
+        return 12288000
+    if rate == 11025 or rate == 22050 or rate == 44100
+        return 11289600
+    0
+
+// The ADC and DAC divider code for SYSCLK / (256 x rate): 0 for 1, 1 for
+// 1.5, 2 for 2, 3 for 3, 4 for 4, 5 for 5.5, 6 for 6; -1 when the ratio is
+// none of them.
+pub fn adcdiv_code(sysclk: Int, rate: Int) -> Int
+    let ratio10 = sysclk * 10 / (256 * rate)
+    if sysclk != ratio10 * 256 * rate / 10
+        return -1
+    if ratio10 == 10
+        return 0
+    if ratio10 == 15
+        return 1
+    if ratio10 == 20
+        return 2
+    if ratio10 == 30
+        return 3
+    if ratio10 == 40
+        return 4
+    if ratio10 == 55
+        return 5
+    if ratio10 == 60
+        return 6
+    -1
+
+// The class-D divider code (R8 bits 8:6) that puts SYSCLK / DCLKDIV closest
+// to 768 kHz within 700 to 800 kHz, or -1.  The dividers are 1.5, 2, 3, 4, 6,
+// 8, 12 and 16.
+pub fn dclkdiv_code(sysclk: Int) -> Int
+    var best = -1
+    var best_gap = 1000000
+    for i in 0..8
+        let d10 = dclk_d10(i)
+        let f = sysclk * 10 / d10
+        if f >= DCLK_MIN_HZ and f <= DCLK_MAX_HZ
+            var gap = f - DCLK_BEST_HZ
+            if gap < 0
+                gap = 0 - gap
+            if gap < best_gap
+                best_gap = gap
+                best = i
+    best
+
+// The class-D divider of a code, times 10.
+fn dclk_d10(code: Int) -> Int
+    if code == 0
+        return 15
+    if code == 1
+        return 20
+    if code == 2
+        return 30
+    if code == 3
+        return 40
+    if code == 4
+        return 60
+    if code == 5
+        return 80
+    if code == 6
+        return 120
+    160
+
+// The BCLK divider code (R8 bits 3:0) for SYSCLK / bclk, or -1 when it is
+// not one of 1, 1.5, 2, 3, 4, 5.5, 6, 8, 11, 12, 16, 22, 24 or 32.
+pub fn bclkdiv_code(sysclk: Int, bclk: Int) -> Int
+    if bclk <= 0 or sysclk * 10 % bclk != 0
+        return -1
+    let d10 = sysclk * 10 / bclk
+    for i in 0..14
+        if bclk_d10(i) == d10
+            return i
+    -1
+
+// The BCLK divider of a code, times 10.
+fn bclk_d10(code: Int) -> Int
+    if code == 0
+        return 10
+    if code == 1
+        return 15
+    if code == 2
+        return 20
+    if code == 3
+        return 30
+    if code == 4
+        return 40
+    if code == 5
+        return 55
+    if code == 6
+        return 60
+    if code == 7
+        return 80
+    if code == 8
+        return 110
+    if code == 9
+        return 120
+    if code == 10
+        return 160
+    if code == 11
+        return 220
+    if code == 12
+        return 240
+    320
+
+// The PLL's settings for `mclk` and the SYSCLK `sysclk`: f2 = 8 x SYSCLK,
+// R = f2 / f1 with f1 = MCLK or MCLK / 2, N = int R, K = int(2^24 x (R - N)).
+// The prescale is 2 when R would otherwise be below 6.  `None` when N is
+// not 6 to 12.
+pub fn pll_plan(mclk: Int, sysclk: Int) -> ?ClockPlan
+    let f2 = sysclk * 8
+    var pre = 1
+    if f2 / mclk < 6
+        pre = 2
+    let n = f2 * pre / mclk
+    if n < 6 or n > 12
+        return None
+    let k = ((f2 * pre) << 24) / mclk - (n << 24)
+    Some(ClockPlan { pll: true, prescale: pre, n: n, k: k, sysdiv: 2, adcdiv: 0, sysclk: sysclk,
+                     dclkdiv: 0, bclkdiv: -1 })
+
+// The clock plan for a format and a master clock, or `None` when the codec
+// cannot make it: a rate that is not one of the nine, a depth other than 16,
+// 24 or 32, an MCLK the PLL cannot use, a SYSCLK for which no class-D
+// divider gives 700 to 800 kHz, or, with the codec as master, a bit clock
+// that is not a whole division of SYSCLK.
+pub fn plan_of(mclk_hz: Int, f: AudioFormat) -> ?ClockPlan
+    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0 or mclk_hz <= 0
+        return None
+    let sysclk = sysclk_of(f.sample_rate)
+    if sysclk == 0
+        return None
+    // Every rate `sysclk_of` accepts has a divider code, and both SYSCLKs
+    // have a class-D divider, so neither code is negative here.
+    let ad = adcdiv_code(sysclk, f.sample_rate)
+    let dc = dclkdiv_code(sysclk)
+    let bc = bclkdiv_code(sysclk, f.sample_rate * f.bit_depth * f.channels)
+    if f.codec_is_master and bc < 0
+        return None
+    var base = ClockPlan { pll: false, prescale: 1, n: 0, k: 0, sysdiv: 0, adcdiv: ad,
+                           sysclk: sysclk, dclkdiv: dc, bclkdiv: bc }
+    if mclk_hz == sysclk
+        return Some(base)
+    if mclk_hz == sysclk * 2
+        base = ClockPlan { pll: false, prescale: 1, n: 0, k: 0, sysdiv: 2, adcdiv: ad,
+                           sysclk: sysclk, dclkdiv: dc, bclkdiv: bc }
+        return Some(base)
+    let found = pll_plan(mclk_hz, sysclk)
+    let Some(p) = found else return None
+    Some(ClockPlan { pll: true, prescale: p.prescale, n: p.n, k: p.k, sysdiv: 2, adcdiv: ad,
+                     sysclk: sysclk, dclkdiv: dc, bclkdiv: bc })
+
+// The word-length code of a bit depth (R7 bits 3:2): 16, 24 or 32 bits, or
+// -1.  The part also has 20 bits, which `AudioFormat` cannot name.
+pub fn wl_code(depth: Int) -> Int
+    if depth == 16
+        return 0
+    if depth == 24
+        return 2
+    if depth == 32
+        return 3
+    -1
+
+// The format code of a framing (R7 bits 1:0): 2 for I2S, 1 for
+// left-justified.
+pub fn fmt_code(f: AudioFraming) -> Int
+    match f
+        AudioFraming.AudioPhilips       => 2
+        AudioFraming.AudioLeftJustified => 1
+
+// The I2S settings for a format.
+pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
+    var role = I2sRole.I2sMaster
+    if f.codec_is_master
+        role = I2sRole.I2sSlave
+    var layout = I2sFormat.I2sPhilips
+    if f.framing == AudioFraming.AudioLeftJustified
+        layout = I2sFormat.I2sLeftJustified
+    I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
+                role: role, format: layout }
+
+// ── The named steps ──────────────────────────────────────────────────
+
+// Step: the reset.  Any write to R15 resets every register; the part is
+// given 100 ms, and the shadow takes the data sheet's reset values.
+pub fn step_reset<P: Wm8960Port>(p: P) -> Bool [hw, mutate]
+    shadow_clear()
+    if not p.write_reg(R_RESET, 0)
+        return false
+    p.pause_ms(RESET_MS)
+    shadow_reset()
+    true
+
+// Step: the base settings after the reset.  With zero-cross volume updates
+// the timeout that updates a volume when no zero crossing comes is enabled
+// (R23 TOEN).
+pub fn step_base<P: Wm8960Port>(p: P, c: Wm8960Config) -> Bool [hw, mutate]
+    if c.zero_cross
+        return reg_update(p, R_ADDCTL1, TOEN, TOEN)
+    true
+
+// Step: the bias up.  The anti-pop bits are set, VMID is enabled as a
+// 2 x 50k divider and given 100 ms to ramp, VREF is enabled, and the
+// anti-pop bits go back to BUFIOEN alone.  After a power-down the headphone
+// capacitors are given the time to discharge first.
+pub fn step_bias_up<P: Wm8960Port>(p: P) -> Bool [hw, mutate]
+    if shadow_flag(SH_DISCH) == 1
+        p.pause_ms(DISCHARGE_MS)
+        shadow_flag_set(SH_DISCH, 0)
+    if not reg_write(p, R_APOP1, APOP1_ON)
+        return false
+    if not reg_update(p, R_POWER1, VMID_MASK, VMID_50K)
+        return false
+    p.pause_ms(VMID_MS)
+    reg_update(p, R_POWER1, VREF, VREF) and reg_write(p, R_APOP1, APOP1_IDLE)
+
+// Step: the bias down.  The anti-pop bits are set, VMID and VREF go off, and
+// the next power-up waits for the capacitors to discharge.
+pub fn step_bias_down<P: Wm8960Port>(p: P) -> Bool [hw, mutate]
+    if not reg_write(p, R_APOP1, APOP1_ON)
+        return false
+    let ok = reg_update(p, R_POWER1, VMID_MASK | VREF, 0)
+    shadow_flag_set(SH_DISCH, 1)
+    ok
+
+// Step: the outputs up.  The DAC's soft mute is set first, then the output
+// mixers, the DAC to mixer routes, the DAC, and the output drivers.  The
+// class-D outputs need a clock for them (`SH_FORMAT`): without one they are
+// not enabled and the step answers false.
+pub fn step_outputs_up<P: Wm8960Port>(p: P, c: Wm8960Config) -> Bool [hw, mutate]
+    if c.speaker and shadow_flag(SH_FORMAT) != 1
+        return false
+    if not reg_update(p, R_DACCTL1, DACMU, DACMU)
+        return false
+    if not (reg_update(p, R_POWER3, PWR3_MIX, PWR3_MIX) and reg_update(p, R_LOUTMIX, LD2LO, LD2LO) and reg_update(p, R_ROUTMIX, RD2RO, RD2RO) and reg_update(p, R_POWER2, PWR2_DAC, PWR2_DAC))
+        return false
+    if c.headphone and not reg_update(p, R_POWER2, PWR2_HP, PWR2_HP)
+        return false
+    if c.speaker
+        return reg_update(p, R_POWER2, PWR2_SPK, PWR2_SPK) and reg_update(p, R_CLASSD1, SPK_OP_MASK, SPK_OP_BOTH)
+    true
+
+// Step: the inputs up.  The input PGAs, the ADCs and the microphone bias are
+// powered, the PGAs are enabled, and both PGAs are unmuted, the right write
+// carrying the update bit.
+pub fn step_inputs_up<P: Wm8960Port>(p: P) -> Bool [hw, mutate]
+    reg_update(p, R_POWER1, PWR1_INPUT, PWR1_INPUT) and reg_update(p, R_POWER3, PWR3_MIC, PWR3_MIC) and reg_update(p, R_LINVOL, INMUTE, 0) and reg_update(p, R_RINVOL, INMUTE | VU, VU)
+
+// Step: power up, the order of the data sheet's bits: bias, outputs, inputs.
+pub fn step_power_up<P: Wm8960Port>(p: P, c: Wm8960Config) -> Bool [hw, mutate]
+    if not step_bias_up(p)
+        return false
+    if (c.headphone or c.speaker) and not step_outputs_up(p, c)
+        return false
+    if c.microphone
+        return step_inputs_up(p)
+    true
+
+// Step: power down.  The DAC is soft-muted, the class-D outputs go off, then
+// the output drivers, the DAC and the mixers, the inputs, the bias and the
+// PLL.  The clock is gone after it, so the format has to be set again.
+pub fn step_power_down<P: Wm8960Port>(p: P) -> Bool [hw, mutate]
+    if not (reg_update(p, R_DACCTL1, DACMU, DACMU) and reg_update(p, R_CLASSD1, SPK_OP_MASK, 0))
+        return false
+    if not (reg_update(p, R_POWER2, PWR2_HP | PWR2_SPK, 0) and reg_update(p, R_POWER2, PWR2_DAC, 0) and reg_update(p, R_POWER3, PWR3_MIX | PWR3_MIC, 0) and reg_update(p, R_POWER1, PWR1_INPUT, 0))
+        return false
+    let ok = step_bias_down(p) and reg_update(p, R_POWER2, PLL_EN, 0) and reg_update(p, R_CLOCK1, CLKSEL, 0)
+    shadow_flag_set(SH_FORMAT, 0)
+    ok
+
+// Step: the audio interface, R7: master or slave, word length and format,
+// leaving the clock and channel-swap bits.
+pub fn step_interface<P: Wm8960Port>(p: P, master: Bool, wl: Int, fmt: Int) -> Bool [hw, mutate]
+    var v = (wl << 2) | fmt
+    if master
+        v = v | 0x40
+    reg_update(p, R_IFACE1, 0x5F, v)
+
+// Step: the clock tree for a plan.  The PLL is switched off while it is
+// changed and SYSCLK taken from MCLK; the dividers are set; with the PLL, its
+// N and K are written, it is enabled and given 250 ms, and SYSCLK is taken
+// from it.  The class-D divider is set, and the bit-clock divider when the
+// codec is master.
+pub fn step_clocks<P: Wm8960Port>(p: P, plan: ClockPlan, master: Bool) -> Bool [hw, mutate]
+    if not reg_update(p, R_POWER2, PLL_EN, 0)
+        return false
+    let clock1 = (plan.adcdiv << 6) | (plan.adcdiv << 3) | (plan.sysdiv << 1)
+    if not reg_update(p, R_CLOCK1, 0x1FF, clock1)
+        return false
+    if plan.pll
+        if not pll_set(p, plan)
+            return false
+    var clock2 = plan.dclkdiv << 6
+    var mask = 0x1C0
+    if master
+        clock2 = clock2 | plan.bclkdiv
+        mask = 0x1CF
+    reg_update(p, R_CLOCK2, mask, clock2)
+
+// The PLL: N and the prescale, then K (in fractional mode when it is not
+// 0), the enable, the lock time, and the select.
+fn pll_set<P: Wm8960Port>(p: P, plan: ClockPlan) -> Bool [hw, mutate]
+    var pll1 = ((plan.prescale - 1) << 4) | plan.n
+    if plan.k != 0
+        pll1 = pll1 | 0x20
+    if not reg_update(p, R_PLL1, 0x03F, pll1)
+        return false
+    if not (reg_write(p, R_PLL2, (plan.k >> 16) & 0xFF) and reg_write(p, R_PLL3, (plan.k >> 8) & 0xFF) and reg_write(p, R_PLL4, plan.k & 0xFF))
+        return false
+    if not reg_update(p, R_POWER2, PLL_EN, PLL_EN)
+        return false
+    p.pause_ms(PLL_MS)
+    reg_update(p, R_CLOCK1, CLKSEL, CLKSEL)
+
+// Brings the part up: the bus ready, the reset, and the base settings.
+// Answers whether the part acknowledged the reset and took every write.
+pub fn start<P: Wm8960Port>(p: P, c: Wm8960Config) -> Bool [hw, mutate]
+    if not p.setup()
+        return false
+    step_reset(p) and step_base(p, c)
+
+// Whether the part acknowledges its address: the shadow's value of R0 is
+// written again, which changes nothing.  False while the shadow is empty.
+pub fn probe<P: Wm8960Port>(p: P) -> Bool [hw, mutate]
+    let v = shadow_get(R_LINVOL)
+    if v < 0
+        return false
+    reg_write(p, R_LINVOL, v)
+
+// ── Format, power, mute and gain ─────────────────────────────────────
+
+// Programs the codec for a format and configures and enables the board's
+// I2S handle for it: the plan found, the handle configured and enabled (the
+// PLL needs MCLK to run), then the interface, and the clocks.  The shadow
+// then records that the class-D outputs have a valid clock.
+pub fn format_set<P: Wm8960Port, S: I2s>(p: P, i2s: S, c: Wm8960Config, f: AudioFormat) -> Bool [hw, mutate]
+    let found = plan_of(c.mclk_hz, f)
+    let Some(plan) = found else return false
+    if not shadow_ready()
+        return false
+    if not i2s.configure(i2s_config_of(f))
+        return false
+    if not i2s.enable()
+        return false
+    if not (step_interface(p, f.codec_is_master, wl_code(f.bit_depth), fmt_code(f.framing)) and step_clocks(p, plan, f.codec_is_master))
+        return false
+    shadow_flag_set(SH_FORMAT, 1)
+    true
+
+// Powers the converters up or down.  Up is `step_power_up` and leaves the DAC
+// soft-muted; down is `step_power_down`, after which the board's I2S handle
+// is disabled.
+pub fn power_set<P: Wm8960Port, S: I2s>(p: P, i2s: S, c: Wm8960Config, on: Bool) -> Bool [hw, mutate]
+    if on
+        return step_power_up(p, c)
+    let ok = step_power_down(p)
+    i2s.disable()
+    ok
+
+// Soft-mutes or unmutes the DAC (R5 DACMU).
+pub fn mute_set<P: Wm8960Port>(p: P, on: Bool) -> Bool [hw, mutate]
+    var v = 0
+    if on
+        v = DACMU
+    reg_update(p, R_DACCTL1, DACMU, v)
+
+// Whether the DAC is soft-muted, from the shadow; `None` while the shadow is
+// empty.
+pub fn mute_get() -> ?Bool [mutate]
+    let v = shadow_get(R_DACCTL1)
+    if v < 0
+        return None
+    Some((v & DACMU) != 0)
+
+// The output volume code of a gain: 0x30 + dB + 73, 0x30 at -73 dB to 0x7F at
+// +6 dB, or `None` below the range.  Codes under 0x30 are the analogue mute.
+pub fn out_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, -73000, 6000, 1000)
+        Some(s) => Some(0x30 + (s.mdb + 73000) / 1000)
+        None    => None
+
+// The gain of an output code in thousandths of a decibel; the codes under
+// 0x30, the mute, read as the lowest step.
+pub fn out_mdb(code: Int) -> Int
+    if code < 0x30
+        return -73000
+    (code - 0x30) * 1000 - 73000
+
+// The input PGA code of a gain: (dB + 17.25) / 0.75, 0 at -17.25 dB to 63 at
+// +30 dB, or `None` below the range.
+pub fn in_code(g: MilliDb) -> ?Int
+    match dev_audio.audio_gain_step(g, -17250, 30000, 750)
+        Some(s) => Some((s.mdb + 17250) / 750)
+        None    => None
+
+// The gain of an input PGA code, in thousandths of a decibel.
+pub fn in_mdb(code: Int) -> Int
+    code * 750 - 17250
+
+// Writes both channels of a volume pair, the left without the update bit and
+// the right with it, so the two change together.  `zcbit` is the zero-cross
+// bit of the registers, or 0 for none: bit 7 of the output volumes, bit 6 of
+// the input PGAs, whose bit 7 is the mute.
+fn pair_write<P: Wm8960Port>(p: P, left: Int, right: Int, code: Int, zcbit: Int) -> Bool [hw, mutate]
+    reg_write(p, left, code | zcbit) and reg_write(p, right, code | zcbit | VU)
+
+// The zero-cross bit of the output volumes and of the input PGAs for a
+// configuration.
+fn out_zc(c: Wm8960Config) -> Int
+    if c.zero_cross
+        return ZC
+    0
+
+fn in_zc(c: Wm8960Config) -> Int
+    if c.zero_cross
+        return INZC
+    0
+
+// Sets the output volume of the headphone and, when powered for it, the
+// speaker drivers to the largest step at or below `g`; the input PGAs to the
+// largest step at or below `g`.  The gain set, or `None` when `g` is below the
+// path's range or the part did not take it.
+pub fn gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, path: CodecPath, g: MilliDb) -> ?MilliDb [hw, mutate]
+    // workaround(a-match-over-an-enum-whose-arms-answer-an-optional-struct-is-emitted-with-a-pointer-slot): a match over CodecPath with ?MilliDb arms fails IR verification, so the path is compared.
+    if path == CodecPath.CodecOutput
+        return out_gain_set(p, c, g)
+    in_gain_set(p, c, g)
+
+fn out_gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
+    let Some(code) = out_code(g) else return None
+    if shadow_get(R_LOUT1) < 0
+        return None
+    if not pair_write(p, R_LOUT1, R_ROUT1, code, out_zc(c))
+        return None
+    if c.speaker and not pair_write(p, R_LOUT2, R_ROUT2, code, out_zc(c))
+        return None
+    Some(MilliDb { mdb: out_mdb(code) })
+
+fn in_gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
+    let Some(code) = in_code(g) else return None
+    if shadow_get(R_LINVOL) < 0
+        return None
+    if not pair_write(p, R_LINVOL, R_RINVOL, code, in_zc(c))
+        return None
+    Some(MilliDb { mdb: in_mdb(code) })
+
+// The gain of a path as the shadow holds it, `None` while the shadow is
+// empty.  The output is the headphone volume, the input the left PGA.
+pub fn gain_get(path: CodecPath) -> ?MilliDb [mutate]
+    if path == CodecPath.CodecOutput
+        return out_gain_get()
+    in_gain_get()
+
+fn out_gain_get() -> ?MilliDb [mutate]
+    let v = shadow_get(R_LOUT1)
+    if v < 0
+        return None
+    Some(MilliDb { mdb: out_mdb(v & 0x7F) })
+
+fn in_gain_get() -> ?MilliDb [mutate]
+    let v = shadow_get(R_LINVOL)
+    if v < 0
+        return None
+    Some(MilliDb { mdb: in_mdb(v & 0x3F) })
+
+// ── Settings the traits have no place for ────────────────────────────
+
+// The DAC's digital volume, both channels: the largest step at or below `g`,
+// -127 dB to 0 dB in 0.5 dB steps, code 1 to 255.  Code 0 is the digital
+// mute.  The gain set, or `None`.
+pub fn dac_volume_set<P: Wm8960Port>(p: P, g: MilliDb) -> ?MilliDb [hw, mutate]
+    match dev_audio.audio_gain_step(g, -127000, 0, 500)
+        Some(s) => dac_volume_write(p, 1 + (s.mdb + 127000) / 500, s.mdb)
+        None    => None
+
+fn dac_volume_write<P: Wm8960Port>(p: P, code: Int, mdb: Int) -> ?MilliDb [hw, mutate]
+    if shadow_get(R_LDAC) < 0
+        return None
+    if not (reg_write(p, R_LDAC, code) and reg_write(p, R_RDAC, code | VU))
+        return None
+    Some(MilliDb { mdb: mdb })
+
+// The ADC's digital volume, both channels: -97 dB to +30 dB in 0.5 dB steps,
+// code 1 to 255; code 0 is the digital mute.
+pub fn adc_volume_set<P: Wm8960Port>(p: P, g: MilliDb) -> ?MilliDb [hw, mutate]
+    match dev_audio.audio_gain_step(g, -97000, 30000, 500)
+        Some(s) => adc_volume_write(p, 1 + (s.mdb + 97000) / 500, s.mdb)
+        None    => None
+
+fn adc_volume_write<P: Wm8960Port>(p: P, code: Int, mdb: Int) -> ?MilliDb [hw, mutate]
+    if shadow_get(R_LADC) < 0
+        return None
+    if not (reg_write(p, R_LADC, code) and reg_write(p, R_RADC, code | VU))
+        return None
+    Some(MilliDb { mdb: mdb })
+
+// The speaker volume alone, by the headphone's rule: the largest step at or
+// below `g`.
+pub fn speaker_volume_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
+    let Some(code) = out_code(g) else return None
+    if shadow_get(R_LOUT2) < 0
+        return None
+    if not pair_write(p, R_LOUT2, R_ROUT2, code, out_zc(c))
+        return None
+    Some(MilliDb { mdb: out_mdb(code) })
+
+// The headphone volume alone, by the same rule.
+pub fn headphone_volume_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
+    let Some(code) = out_code(g) else return None
+    if shadow_get(R_LOUT1) < 0
+        return None
+    if not pair_write(p, R_LOUT1, R_ROUT1, code, out_zc(c))
+        return None
+    Some(MilliDb { mdb: out_mdb(code) })
+
+// The microphone boost of both channels, 0, 13, 20 or 29 dB: the largest
+// step at or below `g`; `None` below 0 dB.
+pub fn mic_boost_set<P: Wm8960Port>(p: P, g: MilliDb) -> ?MilliDb [hw, mutate]
+    if g.mdb < 0
+        return None
+    var code = 0
+    var mdb = 0
+    if g.mdb >= 29000
+        code = 3
+        mdb = 29000
+    elif g.mdb >= 20000
+        code = 2
+        mdb = 20000
+    elif g.mdb >= 13000
+        code = 1
+        mdb = 13000
+    if reg_update(p, R_LINPATH, 0x030, code << 4) and reg_update(p, R_RINPATH, 0x030, code << 4)
+        return Some(MilliDb { mdb: mdb })
+    None
+
+// The microphone bias voltage: 0.9 x AVDD (`false`) or 0.65 x AVDD.
+pub fn mic_bias_set<P: Wm8960Port>(p: P, low: Bool) -> Bool [hw, mutate]
+    var v = 0
+    if low
+        v = 1
+    reg_update(p, R_ADDCTL4, 0x001, v)
+
+// Takes the differential microphone input's non-inverting side from
+// LINPUT2 (`use3` false) or LINPUT3, on both channels, with LINPUT1 the
+// inverting side.
+pub fn mic_differential_set<P: Wm8960Port>(p: P, use3: Bool) -> Bool [hw, mutate]
+    var v = 0x040
+    if use3
+        v = 0x080
+    reg_update(p, R_LINPATH, 0x0C0, v) and reg_update(p, R_RINPATH, 0x0C0, v)
+
+// The speaker boost, 0 to 5 for 1.0x to 1.8x on the DC and AC gains
+// together.  The data sheet says not to change it while the speaker outputs
+// are enabled, so a call with them on is refused.
+pub fn speaker_boost_set<P: Wm8960Port>(p: P, step: Int) -> Bool [hw, mutate]
+    if step < 0 or step > 5
+        return false
+    let on = shadow_get(R_CLASSD1)
+    if on < 0 or (on & SPK_OP_MASK) != 0
+        return false
+    reg_update(p, R_CLASSD3, 0x03F, (step << 3) | step)
+
+// Puts the interface in DSP mode (A when `b` is false, B when true) at the
+// word length of `depth`, as a slave unless `master`.
+pub fn dsp_format_set<P: Wm8960Port>(p: P, master: Bool, depth: Int, b: Bool) -> Bool [hw, mutate]
+    let wl = wl_code(depth)
+    if wl < 0
+        return false
+    let ok = step_interface(p, master, wl, 3)
+    if not ok
+        return false
+    var lrp = 0
+    if b
+        lrp = 0x10
+    reg_update(p, R_IFACE1, 0x10, lrp)
+
+// The ADC to DAC digital loopback (R9 LOOPBACK).
+pub fn loopback_set<P: Wm8960Port>(p: P, on: Bool) -> Bool [hw, mutate]
+    var v = 0
+    if on
+        v = 1
+    reg_update(p, R_IFACE2, 0x001, v)
+
+// Discharges the headphone DC-blocking capacitors (R29 DISOP) through the
+// resistor `res` (0 to 3 for 400, 200, 600 and 150 ohms) for `ms`
+// milliseconds, then stops.  The data sheet gives no time.
+pub fn discharge<P: Wm8960Port>(p: P, res: Int, ms: Int) -> Bool [hw, mutate]
+    if res < 0 or res > 3
+        return false
+    if not reg_write(p, R_APOP2, 0x040 | (res << 4))
+        return false
+    p.pause_ms(ms)
+    reg_write(p, R_APOP2, 0)
+
+// ── The codec on a board's I2C bus and I2S handle ────────────────────
+
+// A WM8960 on a board's I2C bus at the address `w.addr`, 0x1A, and the board's
+// I2S handle that carries its samples.
+pub struct Wm8960<S: I2s>
+    bus: BoardI2c
+    w: DeviceWiring
+    i2s: S
+    cfg: Wm8960Config
+
+// The codec at `w.addr` on the board's I2C bus, with the I2S handle `i2s`
+// for its samples.  Nothing is sent.  A struct with a generic field cannot
+// be a `@value`, so the codec is one cell of the arena, built in a `system`
+// block, the one allocation of the package.
+pub fn attach<S: I2s>(bus: BoardI2c, w: DeviceWiring, i2s: S, cfg: Wm8960Config) -> Wm8960<S>
+    system
+        return Wm8960 { bus: bus, w: w, i2s: i2s, cfg: cfg }
+
+impl Wm8960Port for Wm8960
+    fn setup(self) -> Bool [hw]
+        i2c_setup(self.bus, self.w)
+
+    fn write_reg(self, r: Int, v: Int) -> Bool [hw]
+        i2c_write(self.bus, self.w, r, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        BoardTimer { id: 0 }.delay_ms(ms)
+
+impl Wm8960
+    // Brings the part up (`start`): the reset and the base settings.  The
+    // caller has powered the part and waited for its supply.
+    fn begin(self) -> Bool [hw, mutate]
+        start(self, self.cfg)
+
+    // Whether the part acknowledges its address (`probe`).
+    fn present(self) -> Bool [hw, mutate]
+        probe(self)
+
+    // The shadow's value of a register, -1 while the shadow is empty.
+    fn reg(self, r: Int) -> Int [mutate]
+        shadow_get(r)
+
+    // Writes a register and keeps it in the shadow.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw, mutate]
+        reg_write(self, r, v)
+
+    // The DAC's digital volume (`dac_volume_set`).
+    fn set_dac_volume(self, g: MilliDb) -> ?MilliDb [hw, mutate]
+        dac_volume_set(self, g)
+
+    // The ADC's digital volume (`adc_volume_set`).
+    fn set_adc_volume(self, g: MilliDb) -> ?MilliDb [hw, mutate]
+        adc_volume_set(self, g)
+
+    // The headphone volume alone, and the speaker volume alone.
+    fn set_headphone_volume(self, g: MilliDb) -> ?MilliDb [hw, mutate]
+        headphone_volume_set(self, self.cfg, g)
+
+    fn set_speaker_volume(self, g: MilliDb) -> ?MilliDb [hw, mutate]
+        speaker_volume_set(self, self.cfg, g)
+
+    // The microphone boost and bias (`mic_boost_set`, `mic_bias_set`).
+    fn set_mic_boost(self, g: MilliDb) -> ?MilliDb [hw, mutate]
+        mic_boost_set(self, g)
+
+    fn set_mic_bias(self, low: Bool) -> Bool [hw, mutate]
+        mic_bias_set(self, low)
+
+    // The speaker boost (`speaker_boost_set`).
+    fn set_speaker_boost(self, step: Int) -> Bool [hw, mutate]
+        speaker_boost_set(self, step)
+
+    // DSP mode (`dsp_format_set`).
+    fn set_dsp_format(self, master: Bool, depth: Int, b: Bool) -> Bool [hw, mutate]
+        dsp_format_set(self, master, depth, b)
+
+    // Stops the I2S handle's clocks without powering the codec down.
+    fn i2s_stop(self) [hw]
+        self.i2s.disable()
+
+impl AudioCodec[hw, mutate] for Wm8960
+    fn codec_set_format(self, f: AudioFormat) -> Bool [hw, mutate]
+        format_set(self, self.i2s, self.cfg, f)
+
+    fn codec_set_power(self, on: Bool) -> Bool [hw, mutate]
+        power_set(self, self.i2s, self.cfg, on)
+
+    fn codec_set_mute(self, on: Bool) -> Bool [hw, mutate]
+        mute_set(self, on)
+
+    fn codec_is_muted(self) -> ?Bool [hw, mutate]
+        mute_get()
+
+    fn codec_set_gain(self, path: CodecPath, g: MilliDb) -> ?MilliDb [hw, mutate]
+        gain_set(self, self.cfg, path, g)
+
+    fn codec_gain(self, path: CodecPath) -> ?MilliDb [hw, mutate]
+        gain_get(path)

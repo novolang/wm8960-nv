@@ -1,0 +1,118 @@
+/* playback.nv: a program that brings a WM8960 up and plays a square wave on
+ * its headphone and speaker outputs
+ *
+ * Build:  bash tests/device_build.sh   (the package's own script)
+ *         or make this file the main of a package that depends on
+ *         wm8960-nv and run
+ *             novo build --target=nrf52840-dk src/main.nv
+ * Run:    probe-rs run --chip nRF52840_xxAA main.elf
+ *
+ * NOT a `novo run` program: it targets a board and never ends.
+ *
+ * The part is a WM8960 on a breakout or a hat such as SparkFun's WM8960
+ * breakout or a ReSpeaker 2-Mics, wired to the board's first I2C bus (SDA,
+ * SCL; the address is fixed at 0x1A) and to its I2S block (MCLK, BCLK,
+ * DACLRC and ADCLRC together, DACDAT to the board's data output, ADCDAT to
+ * its data input).  The board is the I2S master at 44.1 kHz, 16 bits, with
+ * MCLK at 256 x fs = 11.2896 MHz, which the codec uses as SYSCLK without its
+ * PLL.  The speaker is 8 ohms on the class-D outputs; headphones go on
+ * HP_L and HP_R.
+ *
+ * The program does what a player does, in the order the package's
+ * documentation gives: `begin` resets the part, `codec_set_format`
+ * configures the board's I2S block and the codec's clocks and interface,
+ * `codec_set_power(true)` brings the bias, the DAC and the output drivers up
+ * with the DAC soft-muted, the output volume is set to -20 dB, and
+ * `codec_set_mute(false)` opens the output once the first buffer is queued.
+ * It prints one line per step over RTT.
+ *
+ * Effects the program declares: [hw], for the I2C bus, the I2S block, the
+ * UART and the timer, and [mutate], for the driver's shadow of the
+ * write-only registers.  The driver allocates one cell at `attach`; the
+ * program allocates nothing after it starts.
+ *
+ * The I2S block: neither the nRF52840-DK's nor the nRF54LM20-DK's board
+ * package has an I2S block driver yet, and embedded-hal-nv has no board
+ * handle for one.  The program is therefore written against the `I2s`
+ * trait and is given `NoI2s`, a stand-in that refuses to be configured and
+ * transmits nothing.  Neither board has a driver for its two-wire
+ * interface (TWIM) either, so `BoardI2c` is absent hardware there.  Both
+ * images print "no answer from the codec at 0x1A".  The part has not been
+ * driven on a board.
+ */
+use embedded_hal.{ I2s, I2sConfig, BoardI2c }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use dev_bus
+use wm8960
+
+// The stand-in for a board's I2S block that is not there.
+@value
+struct NoI2s
+    id: Int
+
+impl I2s for NoI2s
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+        false
+
+    fn sample_rate(self) -> Int [hw]
+        0
+
+    fn enable(self) -> Bool [hw]
+        false
+
+    fn disable(self) [hw]
+        pass
+
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+        -1
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        -1
+
+    fn xruns(self) -> Int [hw]
+        0
+
+// Fills `buf` with 128 stereo frames of a square wave of 50 samples a half
+// period, 441 Hz at 44.1 kHz, at a quarter of full scale.
+@tier(embedded)
+fn square(var buf: Vec[i32; 256])
+    buf.clear()
+    for i in 0..128
+        var v = 8192
+        if (i / 50) % 2 == 1
+            v = 0 - 8192
+        let _ = buf.push(v as i32)
+        let _ = buf.push(v as i32)
+
+@tier(embedded)
+fn main() [hw, mutate]
+    bsp.board.init()
+    let i2s = NoI2s { id: 0 }
+    let part = wm8960.attach(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, 0x1A), i2s,
+                             wm8960.config_default(11289600))
+    if not part.begin()
+        hal.uart.write("no answer from the codec at 0x1A\n")
+    else
+        hal.uart.write("codec reset\n")
+    let f = AudioFormat { sample_rate: 44100, bit_depth: 16, channels: 2,
+                          framing: AudioFraming.AudioPhilips, codec_is_master: false }
+    if not part.codec_set_format(f)
+        hal.uart.write("format refused\n")
+    if not part.codec_set_power(true)
+        hal.uart.write("power up refused\n")
+    let set = part.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: -20000 })
+    if set == None
+        hal.uart.write("volume refused\n")
+    var buf: Vec[i32; 256] = Vec.new()
+    square(var buf)
+    let first = i2s.transmit(var buf)
+    if first < 0
+        hal.uart.write("no samples sent\n")
+    elif not part.codec_set_mute(false)
+        hal.uart.write("unmute refused\n")
+    while true
+        let sent = i2s.transmit(var buf)
+        if sent < 0
+            hal.timer.delay_ms(500)
+        else
+            hal.timer.delay_ms(1)

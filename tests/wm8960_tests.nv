@@ -1,0 +1,1093 @@
+// wm8960_tests — the driver over a double of the part: a write-only
+// register file on an I2C bus, and a double of the board's I2S handle.
+//
+// The double does what the data sheet says the part does on the bus: a
+// write is two bytes, the register number in bits 7 to 1 of the first and
+// the ninth data bit in its bit 0, and a write to R15 resets every register
+// to the reset value of the register map.  The update bit at the top of a
+// volume register is an action and is not kept.  The part cannot be read,
+// so the tests compare the driver's shadow with the double's register file
+// after a sequence, and the log with the sequence the data sheet's bits and
+// the reference drivers fix.
+//
+// Log entries: a write of `v` to register `r` is `1000000 + r * 1000 + v`;
+// a pause of `ms` milliseconds is `2000000 + ms`.  `lw` and `lp` build them.
+//
+// The chip's state, in `st`: 0 is 1 when a part is there, 1 the writes seen,
+// 2 the write number from which every write is refused (0 for none), 4 the
+// I2C clock set, 7 and 8 the bytes of the last write, 9 the entries in the
+// log.  The I2S double's state, in `ist`, is as in the other packages of
+// this family: 0 configure calls, 1 rate, 2 depth, 3 channels, 4 role (0
+// master, 1 slave), 5 format (0 Philips, 1 left-justified), 6 enabled, 8
+// refuse configure, 10 disable calls, 13 refuse enable.
+//
+// The driver's shadow is module state, so every test that touches it starts
+// from `shadow_reset` or `shadow_clear`.
+
+use std.test
+use embedded_hal.{ BoardI2c, I2cBus, I2s, I2sConfig, I2sRole, I2sFormat }
+use dev_bus.{ DeviceWiring }
+use dev_audio.{ AudioCodec, AudioFormat, AudioFraming, CodecPath, MilliDb }
+use wm8960
+use wm8960.{ Wm8960Port, Wm8960Config, ClockPlan }
+
+// ── The doubles ──────────────────────────────────────────────────────
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// A part in its reset state.
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(), st: HashMap.new(), log: HashMap.new() }
+    chip_reset(c)
+    c.st.insert(0, 1)
+    c
+
+fn chip_reset(c: Chip)
+    for r in 0..56
+        c.regs.insert(r, wm8960.reset_value(r))
+
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 9)
+    c.log.insert(n, v)
+    c.st.insert(9, n + 1)
+
+fn log_clear(c: Chip)
+    c.st.insert(9, 0)
+
+fn lw(r: Int, v: Int) -> Int
+    1000000 + r * 1000 + v
+
+fn lp(ms: Int) -> Int
+    2000000 + ms
+
+// Asserts the log holds exactly `want`, then empties it.
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 9), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Whether a register has an update bit at the top, which the part does not
+// keep.
+fn has_vu(r: Int) -> Bool
+    r == 0 or r == 1 or r == 2 or r == 3 or r == 10 or r == 11 or r == 21 or r == 22 or r == 40 or r == 41
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(4, freq)
+
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        if data.len() != 2
+            return false
+        let hi = data[0] as Int
+        let lo = data[1] as Int
+        let r = hi >> 1
+        let v = ((hi & 1) << 8) | lo
+        self.c.st.insert(7, hi)
+        self.c.st.insert(8, lo)
+        log_push(self.c, lw(r, v))
+        let n = at(self.c.st, 1) + 1
+        self.c.st.insert(1, n)
+        if addr != 0x1A or at(self.c.st, 0) == 0
+            return false
+        let from = at(self.c.st, 2)
+        if from > 0 and n >= from
+            return false
+        if r == 15
+            chip_reset(self.c)
+            return true
+        if r < 56
+            if has_vu(r)
+                self.c.regs.insert(r, v & 0xFF)
+            else
+                self.c.regs.insert(r, v)
+        true
+
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        None
+
+// The port: the package's own functions over the double, and a pause that
+// is logged and not waited.
+struct Dut
+    bus: FakeI2c
+    w: DeviceWiring
+
+impl Wm8960Port for Dut
+    fn setup(self) -> Bool [hw]
+        wm8960.i2c_setup(self.bus, self.w)
+
+    fn write_reg(self, r: Int, v: Int) -> Bool [hw]
+        wm8960.i2c_write(self.bus, self.w, r, v)
+
+    fn pause_ms(self, ms: Int) [hw]
+        log_push(self.bus.c, lp(ms))
+
+@tier(app)
+fn dut(c: Chip) -> Dut
+    Dut { bus: FakeI2c { c: c }, w: dev_bus.wiring_i2c(0, 0x1A) }
+
+struct Link
+    st: HashMap<Int, Int>
+
+fn link() -> Link
+    Link { st: HashMap.new() }
+
+impl I2s for Link
+    fn configure(self, c: I2sConfig) -> Bool [hw]
+        self.st.insert(0, at(self.st, 0) + 1)
+        if at(self.st, 8) == 1
+            return false
+        self.st.insert(1, c.sample_rate)
+        self.st.insert(2, c.bit_depth)
+        self.st.insert(3, c.channels)
+        if c.role == I2sRole.I2sMaster
+            self.st.insert(4, 0)
+        else
+            self.st.insert(4, 1)
+        if c.format == I2sFormat.I2sPhilips
+            self.st.insert(5, 0)
+        else
+            self.st.insert(5, 1)
+        true
+
+    fn sample_rate(self) -> Int [hw]
+        at(self.st, 1)
+
+    fn enable(self) -> Bool [hw]
+        if at(self.st, 13) == 1
+            return false
+        self.st.insert(6, 1)
+        true
+
+    fn disable(self) [hw]
+        self.st.insert(6, 0)
+        self.st.insert(10, at(self.st, 10) + 1)
+
+    fn transmit(self, var buf: Vec[i32; 256]) -> Int [hw]
+        -1
+
+    fn receive(self, var buf: Vec[i32; 256], n: Int) -> Int [hw]
+        -1
+
+    fn xruns(self) -> Int [hw]
+        0
+
+fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
+    AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
+                  codec_is_master: master }
+
+fn cfg(mclk: Int) -> Wm8960Config
+    wm8960.config_default(mclk)
+
+// The shadow equals the part's registers: the one property the whole driver
+// rests on.
+fn shadow_matches(c: Chip)
+    for r in 0..56
+        test.assert_eq(wm8960.shadow_get(r), reg_of(c, r))
+
+// A started part: the shadow at its reset values and the log empty.
+fn fresh() -> Chip
+    wm8960.shadow_reset()
+    chip()
+
+// ── The control word ─────────────────────────────────────────────────
+
+@test
+fn test_a_write_is_the_register_and_the_ninth_bit_then_the_low_byte() [io]
+    test.assert_eq(wm8960.word_hi(2, 0x1A5), 5)
+    test.assert_eq(wm8960.word_lo(0x1A5), 0xA5)
+    test.assert_eq(wm8960.word_hi(55, 0x0E9), 110)
+    test.assert_eq(wm8960.word_lo(0x0E9), 0xE9)
+    test.assert_eq(wm8960.word_hi(15, 0), 30)
+    test.assert_eq(wm8960.word_hi(127, 0x1FF), 255)
+    test.assert_eq(wm8960.word_hi(128, 0), 0)
+
+@test
+fn test_the_two_bytes_reach_the_bus_in_one_transaction() [io, hw]
+    wm8960.shadow_reset()
+    let c = chip()
+    let d = dut(c)
+    test.assert(d.write_reg(2, 0x1A5))
+    test.assert_eq(at(c.st, 7), 5)
+    test.assert_eq(at(c.st, 8), 0xA5)
+    log_is(c, [lw(2, 0x1A5)])
+    test.assert_eq(at(c.st, 1), 1)
+
+@test
+fn test_setup_sets_the_bus_to_400_khz_and_needs_an_address() [io, hw]
+    let c = chip()
+    test.assert(dut(c).setup())
+    test.assert_eq(at(c.st, 4), 400000)
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not Dut { bus: FakeI2c { c: c }, w: w }.setup())
+
+@test
+fn test_a_part_that_is_not_there_refuses_the_write() [io, hw]
+    let c = chip()
+    c.st.insert(0, 0)
+    test.assert(not dut(c).write_reg(2, 1))
+
+// ── The shadow ───────────────────────────────────────────────────────
+
+@test
+fn test_the_shadow_starts_from_the_register_maps_reset_values() [io, hw]
+    wm8960.shadow_reset()
+    test.assert(wm8960.shadow_ready())
+    test.assert_eq(wm8960.shadow_get(0), 0x097)
+    test.assert_eq(wm8960.shadow_get(5), 0x008)
+    test.assert_eq(wm8960.shadow_get(7), 0x00A)
+    test.assert_eq(wm8960.shadow_get(8), 0x1C0)
+    test.assert_eq(wm8960.shadow_get(10), 0x0FF)
+    test.assert_eq(wm8960.shadow_get(23), 0x1C0)
+    test.assert_eq(wm8960.shadow_get(32), 0x100)
+    test.assert_eq(wm8960.shadow_get(34), 0x050)
+    test.assert_eq(wm8960.shadow_get(42), 0x040)
+    test.assert_eq(wm8960.shadow_get(49), 0x037)
+    test.assert_eq(wm8960.shadow_get(50), 0x04D)
+    test.assert_eq(wm8960.shadow_get(51), 0x080)
+    test.assert_eq(wm8960.shadow_get(52), 0x008)
+    test.assert_eq(wm8960.shadow_get(53), 0x031)
+    test.assert_eq(wm8960.shadow_get(54), 0x026)
+    test.assert_eq(wm8960.shadow_get(55), 0x0E9)
+    test.assert_eq(wm8960.shadow_get(2), 0)
+    test.assert_eq(wm8960.shadow_get(56), -1)
+    test.assert_eq(wm8960.shadow_get(-1), -1)
+    test.assert_eq(wm8960.reset_value(56), -1)
+    test.assert_eq(wm8960.reset_value(-1), -1)
+
+@test
+fn test_an_empty_shadow_knows_nothing_and_refuses_updates() [io, hw]
+    wm8960.shadow_clear()
+    test.assert(not wm8960.shadow_ready())
+    test.assert_eq(wm8960.shadow_get(0), -1)
+    let c = chip()
+    test.assert(not wm8960.reg_update(dut(c), 5, 8, 0))
+    test.assert_eq(at(c.st, 9), 0)
+    test.assert(wm8960.mute_get() == None)
+    test.assert(wm8960.gain_get(CodecPath.CodecOutput) == None)
+    test.assert(wm8960.gain_get(CodecPath.CodecInput) == None)
+    test.assert(not wm8960.probe(dut(c)))
+
+@test
+fn test_a_write_is_kept_in_nine_bits_and_a_number_outside_the_map_is_refused() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.reg_write(d, 5, 0x3FF))
+    test.assert_eq(wm8960.shadow_get(5), 0x1FF)
+    test.assert(not wm8960.reg_write(d, 56, 1))
+    test.assert(not wm8960.reg_write(d, -1, 1))
+    test.assert_eq(at(c.st, 1), 1)
+    shadow_matches(c)
+
+// The update bit is an action. The part does not keep it, and neither does
+// the shadow, so a later update of the register does not send it again.
+@test
+fn test_the_update_bit_is_never_kept() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.reg_write(d, 3, 0x1F9))
+    test.assert_eq(wm8960.shadow_get(3), 0xF9)
+    test.assert_eq(reg_of(c, 3), 0xF9)
+    test.assert(wm8960.reg_update(d, 3, 0x7F, 0x30))
+    log_is(c, [lw(3, 0x1F9), lw(3, 0x0B0)])
+    shadow_matches(c)
+
+@test
+fn test_a_refused_write_leaves_the_shadow_as_it_was() [io, hw]
+    let c = fresh()
+    c.st.insert(2, 1)
+    test.assert(not wm8960.reg_write(dut(c), 5, 0x1FF))
+    test.assert_eq(wm8960.shadow_get(5), 0x008)
+
+@test
+fn test_an_update_changes_only_the_bits_of_the_mask() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.reg_update(d, 34, 0x100, 0x100))
+    test.assert_eq(wm8960.shadow_get(34), 0x150)
+    test.assert(wm8960.reg_update(d, 34, 0x070, 0x020))
+    test.assert_eq(wm8960.shadow_get(34), 0x120)
+    log_is(c, [lw(34, 0x150), lw(34, 0x120)])
+    shadow_matches(c)
+
+@test
+fn test_a_write_while_the_shadow_is_empty_is_sent_and_not_kept() [io, hw]
+    wm8960.shadow_clear()
+    let c = chip()
+    test.assert(wm8960.reg_write(dut(c), 5, 0x008))
+    test.assert(not wm8960.shadow_ready())
+
+// ── Reset and base state ─────────────────────────────────────────────
+
+@test
+fn test_the_reset_writes_r15_waits_and_restores_the_shadow() [io, hw]
+    wm8960.shadow_reset()
+    let c = chip()
+    c.regs.insert(2, 0x55)
+    test.assert(wm8960.reg_write(dut(c), 2, 0x55))
+    log_clear(c)
+    test.assert(wm8960.step_reset(dut(c)))
+    log_is(c, [lw(15, 0), lp(100)])
+    test.assert_eq(wm8960.shadow_get(2), 0)
+    shadow_matches(c)
+
+@test
+fn test_a_reset_that_is_refused_leaves_no_shadow() [io, hw]
+    wm8960.shadow_reset()
+    let c = chip()
+    c.st.insert(2, 1)
+    test.assert(not wm8960.step_reset(dut(c)))
+    test.assert(not wm8960.shadow_ready())
+    log_is(c, [lw(15, 0)])
+
+@test
+fn test_start_resets_and_enables_the_zero_cross_timeout() [io, hw]
+    wm8960.shadow_clear()
+    let c = chip()
+    test.assert(wm8960.start(dut(c), cfg(12000000)))
+    test.assert_eq(at(c.st, 4), 400000)
+    log_is(c, [lw(15, 0), lp(100), lw(23, 0x1C1)])
+    shadow_matches(c)
+
+@test
+fn test_start_without_zero_cross_only_resets() [io, hw]
+    wm8960.shadow_clear()
+    let c = chip()
+    let plain = Wm8960Config { mclk_hz: 12000000, headphone: true, speaker: false, microphone: false,
+                               zero_cross: false }
+    test.assert(wm8960.start(dut(c), plain))
+    log_is(c, [lw(15, 0), lp(100)])
+
+@test
+fn test_start_reports_a_missing_part_and_a_refused_base_write() [io, hw]
+    wm8960.shadow_clear()
+    let c = chip()
+    c.st.insert(0, 0)
+    test.assert(not wm8960.start(dut(c), cfg(12000000)))
+    let c2 = chip()
+    c2.st.insert(2, 2)
+    test.assert(not wm8960.start(dut(c2), cfg(12000000)))
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not wm8960.start(Dut { bus: FakeI2c { c: chip() }, w: w }, cfg(12000000)))
+
+@test
+fn test_probe_writes_r0_again_and_changes_nothing() [io, hw]
+    let c = fresh()
+    test.assert(wm8960.probe(dut(c)))
+    log_is(c, [lw(0, 0x097)])
+    shadow_matches(c)
+    c.st.insert(0, 0)
+    test.assert(not wm8960.probe(dut(c)))
+
+// ── The clock ────────────────────────────────────────────────────────
+
+@test
+fn test_sysclk_is_12_288_or_11_2896_mhz_by_rate() [io]
+    for r in [8000, 12000, 16000, 24000, 32000, 48000]
+        test.assert_eq(wm8960.sysclk_of(r), 12288000)
+    for r in [11025, 22050, 44100]
+        test.assert_eq(wm8960.sysclk_of(r), 11289600)
+    test.assert_eq(wm8960.sysclk_of(96000), 0)
+    test.assert_eq(wm8960.sysclk_of(20000), 0)
+
+// SYSCLK / (256 x d): 48 and 44.1 kHz are d = 1, 32 kHz 1.5, 24 and 22.05
+// kHz 2, 16 kHz 3, 12 and 11.025 kHz 4, 8 kHz 6.
+@test
+fn test_the_adc_and_dac_dividers_of_the_nine_rates() [io]
+    test.assert_eq(wm8960.adcdiv_code(12288000, 48000), 0)
+    test.assert_eq(wm8960.adcdiv_code(12288000, 32000), 1)
+    test.assert_eq(wm8960.adcdiv_code(12288000, 24000), 2)
+    test.assert_eq(wm8960.adcdiv_code(12288000, 16000), 3)
+    test.assert_eq(wm8960.adcdiv_code(12288000, 12000), 4)
+    test.assert_eq(wm8960.adcdiv_code(12288000, 8000), 6)
+    test.assert_eq(wm8960.adcdiv_code(11289600, 44100), 0)
+    test.assert_eq(wm8960.adcdiv_code(11289600, 22050), 2)
+    test.assert_eq(wm8960.adcdiv_code(11289600, 11025), 4)
+    test.assert_eq(wm8960.adcdiv_code(14080000, 10000), 5)
+    test.assert_eq(wm8960.adcdiv_code(12288000, 44100), -1)
+    test.assert_eq(wm8960.adcdiv_code(12288000, 7000), -1)
+    test.assert_eq(wm8960.adcdiv_code(6400000, 10000), -1)
+
+@test
+fn test_the_class_d_clock_is_768_khz_or_705_6_khz() [io]
+    test.assert_eq(wm8960.dclkdiv_code(12288000), 7)
+    test.assert_eq(wm8960.dclkdiv_code(11289600), 7)
+    test.assert_eq(wm8960.dclkdiv_code(6144000), 5)
+    test.assert_eq(wm8960.dclkdiv_code(2000000), -1)
+    test.assert_eq(wm8960.dclkdiv_code(100000000), -1)
+
+@test
+fn test_the_bit_clock_divider_codes() [io]
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 3072000), 4)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 12288000), 0)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 8192000), 1)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 6144000), 2)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 4096000), 3)
+    test.assert_eq(wm8960.bclkdiv_code(11000000, 2000000), 5)
+    test.assert_eq(wm8960.bclkdiv_code(11000000, 1000000), 8)
+    test.assert_eq(wm8960.bclkdiv_code(22000000, 1000000), 11)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 2048000), 6)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 1536000), 7)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 1024000), 9)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 768000), 10)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 512000), 12)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 384000), 13)
+    test.assert_eq(wm8960.bclkdiv_code(11289600, 1411200), 7)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 2304000), -1)
+    test.assert_eq(wm8960.bclkdiv_code(12288000, 0), -1)
+
+fn pll_is(mclk: Int, sysclk: Int, pre: Int, n: Int, k: Int)
+    match wm8960.pll_plan(mclk, sysclk)
+        Some(p) =>
+            test.assert_eq(p.prescale, pre)
+            test.assert_eq(p.n, n)
+            test.assert_eq(p.k, k)
+            test.assert(p.pll)
+            test.assert_eq(p.sysdiv, 2)
+        None => test.assert(false)
+
+// The formula of the data sheet, K = int(2^24 x (R - N)), for the clocks of
+// the task: 12 MHz and 24 MHz to 44.1 and 48 kHz.  R is 7.5264 and 8.192;
+// K is 0x86C226 and 0x3126E9, the value the data sheet's worked example
+// prints.
+@test
+fn test_the_pll_for_12_and_24_mhz_to_44_1_and_48_khz() [io]
+    pll_is(12000000, 11289600, 1, 7, 0x86C226)
+    pll_is(12000000, 12288000, 1, 8, 0x3126E9)
+    pll_is(24000000, 11289600, 2, 7, 0x86C226)
+    pll_is(24000000, 12288000, 2, 8, 0x3126E9)
+
+fn table45(mclk: Int, sysclk: Int, pre: Int, n: Int, k: Int)
+    match wm8960.pll_plan(mclk, sysclk)
+        Some(p) =>
+            test.assert_eq(p.prescale, pre)
+            test.assert_eq(p.n, n)
+            let d = p.k - k
+            test.assert(d >= -1 and d <= 1)
+        None => test.assert(false)
+
+// Table 45 of the data sheet: prescale, N and a K that the formula matches
+// within one count, the last digit of several rows being a count off.
+@test
+fn test_the_pll_agrees_with_table_45_within_one_count_of_k() [io]
+    table45(12000000, 11289600, 1, 7, 0x86C226)
+    table45(12000000, 12288000, 1, 8, 0x3126E8)
+    table45(13000000, 11289600, 1, 6, 0xF28BD4)
+    table45(13000000, 12288000, 1, 7, 0x8FD525)
+    table45(14400000, 11289600, 1, 6, 0x45A1CA)
+    table45(14400000, 12288000, 1, 6, 0xD3A06E)
+    table45(19200000, 11289600, 2, 9, 0x6872AF)
+    table45(19200000, 12288000, 2, 10, 0x3D70A3)
+    table45(19680000, 11289600, 2, 9, 0x2DB492)
+    table45(19680000, 12288000, 2, 9, 0xFD809F)
+    table45(19800000, 11289600, 2, 9, 0x1F76F7)
+    table45(19800000, 12288000, 2, 9, 0xEE009E)
+    table45(24000000, 11289600, 2, 7, 0x86C226)
+    table45(24000000, 12288000, 2, 8, 0x3126E8)
+    table45(26000000, 11289600, 2, 6, 0xF28BD4)
+    table45(26000000, 12288000, 2, 7, 0x8FD525)
+    table45(27000000, 11289600, 2, 6, 0xB0AC93)
+    table45(27000000, 12288000, 2, 7, 0x482296)
+
+@test
+fn test_a_clock_the_pll_cannot_use_is_refused() [io]
+    test.assert(wm8960.pll_plan(4000000, 12288000) == None)
+    test.assert(wm8960.pll_plan(100000000, 12288000) == None)
+
+@test
+fn test_the_plan_uses_mclk_directly_when_it_is_sysclk_or_twice_it() [io]
+    match wm8960.plan_of(12288000, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
+        Some(p) =>
+            test.assert(not p.pll)
+            test.assert_eq(p.sysdiv, 0)
+            test.assert_eq(p.adcdiv, 0)
+            test.assert_eq(p.dclkdiv, 7)
+            test.assert_eq(p.sysclk, 12288000)
+        None => test.assert(false)
+    match wm8960.plan_of(24576000, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
+        Some(p) =>
+            test.assert(not p.pll)
+            test.assert_eq(p.sysdiv, 2)
+        None => test.assert(false)
+    match wm8960.plan_of(12000000, fmt_of(8000, 16, 2, AudioFraming.AudioPhilips, false))
+        Some(p) =>
+            test.assert(p.pll)
+            test.assert_eq(p.adcdiv, 6)
+            test.assert_eq(p.n, 8)
+        None => test.assert(false)
+
+@test
+fn test_a_format_the_codec_cannot_make_has_no_plan() [io]
+    let m = 12000000
+    test.assert(wm8960.plan_of(m, fmt_of(96000, 32, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(wm8960.plan_of(m, fmt_of(20000, 32, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(wm8960.plan_of(m, fmt_of(48000, 8, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(wm8960.plan_of(m, fmt_of(48000, 16, 3, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(wm8960.plan_of(0, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(wm8960.plan_of(4000000, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)) == None)
+    // 24-bit stereo is a bit clock of 48 fs, no whole division of SYSCLK, so
+    // as master it is refused and as slave it is not.
+    test.assert(wm8960.plan_of(m, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, true)) == None)
+    test.assert(wm8960.plan_of(m, fmt_of(48000, 24, 2, AudioFraming.AudioPhilips, false)) != None)
+
+@test
+fn test_the_word_length_format_and_i2s_codes() [io]
+    test.assert_eq(wm8960.wl_code(16), 0)
+    test.assert_eq(wm8960.wl_code(24), 2)
+    test.assert_eq(wm8960.wl_code(32), 3)
+    test.assert_eq(wm8960.wl_code(8), -1)
+    test.assert_eq(wm8960.fmt_code(AudioFraming.AudioPhilips), 2)
+    test.assert_eq(wm8960.fmt_code(AudioFraming.AudioLeftJustified), 1)
+    let a = wm8960.i2s_config_of(fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false))
+    test.assert(a.role == I2sRole.I2sMaster)
+    test.assert(a.format == I2sFormat.I2sPhilips)
+    let b = wm8960.i2s_config_of(fmt_of(44100, 16, 2, AudioFraming.AudioLeftJustified, true))
+    test.assert(b.role == I2sRole.I2sSlave)
+    test.assert(b.format == I2sFormat.I2sLeftJustified)
+
+// ── The format ───────────────────────────────────────────────────────
+
+// 12 MHz to 48 kHz, 32 bits, slave: R = 8.192, N 8, K 0x3126E9, SYSCLKDIV 2,
+// and SYSCLK taken from the PLL only after the lock time.
+@test
+fn test_48_khz_32_bit_slave_from_12_mhz_through_the_pll() [io, hw]
+    let c = fresh()
+    let l = link()
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(wm8960.format_set(dut(c), l, cfg(12000000), f))
+    log_is(c, [lw(7, 0x00E), lw(26, 0), lw(4, 4), lw(52, 0x28), lw(53, 0x31), lw(54, 0x26), lw(55, 0xE9), lw(26, 1), lp(250), lw(4, 5), lw(8, 0x1C0)])
+    shadow_matches(c)
+    test.assert_eq(at(l.st, 0), 1)
+    test.assert_eq(at(l.st, 1), 48000)
+    test.assert_eq(at(l.st, 2), 32)
+    test.assert_eq(at(l.st, 4), 0)
+    test.assert_eq(at(l.st, 5), 0)
+    test.assert_eq(at(l.st, 6), 1)
+
+// 24 MHz is halved before the PLL, and 44.1 kHz needs R = 7.5264.
+@test
+fn test_44_1_khz_from_24_mhz_halves_mclk_before_the_pll() [io, hw]
+    let c = fresh()
+    let f = fmt_of(44100, 16, 2, AudioFraming.AudioLeftJustified, false)
+    let l = link()
+    test.assert(wm8960.format_set(dut(c), l, cfg(24000000), f))
+    log_is(c, [lw(7, 0x001), lw(26, 0), lw(4, 4), lw(52, 0x37), lw(53, 0x86), lw(54, 0xC2), lw(55, 0x26), lw(26, 1), lp(250), lw(4, 5), lw(8, 0x1C0)])
+    test.assert_eq(at(l.st, 5), 1)
+    shadow_matches(c)
+
+// Table 46: 11.2896 MHz in, the codec as master, 44.1 kHz, 16 bits: no PLL,
+// BCLK = SYSCLK / 8 and the class-D clock SYSCLK / 16 = 705.6 kHz.
+@test
+fn test_44_1_khz_16_bit_master_from_11_2896_mhz_without_the_pll() [io, hw]
+    let c = fresh()
+    let l = link()
+    let f = fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, true)
+    test.assert(wm8960.format_set(dut(c), l, cfg(11289600), f))
+    log_is(c, [lw(7, 0x042), lw(26, 0), lw(4, 0), lw(8, 0x1C7)])
+    test.assert_eq(at(l.st, 4), 1)
+    shadow_matches(c)
+
+@test
+fn test_8_khz_from_a_12_288_mhz_clock_and_its_double() [io, hw]
+    let c = fresh()
+    let f = fmt_of(8000, 16, 2, AudioFraming.AudioPhilips, false)
+    test.assert(wm8960.format_set(dut(c), link(), cfg(12288000), f))
+    log_is(c, [lw(7, 0x002), lw(26, 0), lw(4, 0x1B0), lw(8, 0x1C0)])
+    let c2 = fresh()
+    test.assert(wm8960.format_set(dut(c2), link(), cfg(24576000), f))
+    log_is(c2, [lw(7, 0x002), lw(26, 0), lw(4, 0x1B4), lw(8, 0x1C0)])
+
+@test
+fn test_a_format_sets_the_flag_that_lets_the_class_d_outputs_on() [io, hw]
+    let c = fresh()
+    let a = Wm8960Config { mclk_hz: 12288000, headphone: false, speaker: true, microphone: false,
+                           zero_cross: true }
+    test.assert(not wm8960.step_outputs_up(dut(c), a))
+    test.assert_eq(at(c.st, 9), 0)
+    test.assert(wm8960.format_set(dut(c), link(), a, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)))
+    log_clear(c)
+    test.assert(wm8960.step_outputs_up(dut(c), a))
+
+@test
+fn test_a_format_the_codec_or_the_handle_cannot_take_writes_nothing() [io, hw]
+    let c = fresh()
+    let l = link()
+    test.assert(not wm8960.format_set(dut(c), l, cfg(12000000), fmt_of(96000, 32, 2, AudioFraming.AudioPhilips, false)))
+    test.assert_eq(at(l.st, 0), 0)
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    l.st.insert(8, 1)
+    test.assert(not wm8960.format_set(dut(c), l, cfg(12000000), f))
+    test.assert_eq(at(l.st, 6), 0)
+    let k = link()
+    k.st.insert(13, 1)
+    test.assert(not wm8960.format_set(dut(c), k, cfg(12000000), f))
+    test.assert_eq(at(k.st, 0), 1)
+    test.assert_eq(at(c.st, 9), 0)
+    wm8960.shadow_clear()
+    test.assert(not wm8960.format_set(dut(c), link(), cfg(12000000), f))
+    test.assert_eq(at(c.st, 9), 0)
+
+@test
+fn test_a_write_refused_part_way_through_the_format_is_reported() [io, hw]
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    for k in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        let c = fresh()
+        c.st.insert(2, k)
+        test.assert(not wm8960.format_set(dut(c), link(), cfg(12000000), f))
+
+// ── The named steps ──────────────────────────────────────────────────
+
+@test
+fn test_the_bias_comes_up_in_the_order_of_the_anti_pop_bits() [io, hw]
+    let c = fresh()
+    test.assert(wm8960.step_bias_up(dut(c)))
+    log_is(c, [lw(28, 0x9C), lw(25, 0x080), lp(100), lw(25, 0x0C0), lw(28, 0x08)])
+    shadow_matches(c)
+
+@test
+fn test_the_bias_down_sets_the_anti_pop_bits_and_waits_for_the_discharge_next_time() [io, hw]
+    let c = fresh()
+    test.assert(wm8960.step_bias_up(dut(c)))
+    log_clear(c)
+    test.assert(wm8960.step_bias_down(dut(c)))
+    log_is(c, [lw(28, 0x9C), lw(25, 0)])
+    test.assert(wm8960.step_bias_up(dut(c)))
+    log_is(c, [lp(600), lw(28, 0x9C), lw(25, 0x080), lp(100), lw(25, 0x0C0), lw(28, 0x08)])
+    test.assert(wm8960.step_bias_down(dut(c)))
+    log_clear(c)
+    test.assert(wm8960.step_bias_up(dut(c)))
+    test.assert_eq(at(c.log, 0), lp(600))
+
+@test
+fn test_the_bias_with_an_empty_shadow_writes_the_anti_pop_register_and_stops() [io, hw]
+    wm8960.shadow_clear()
+    let c = chip()
+    test.assert(not wm8960.step_bias_up(dut(c)))
+    log_is(c, [lw(28, 0x9C)])
+    test.assert(not wm8960.shadow_ready())
+
+@test
+fn test_a_bias_that_is_refused_is_reported() [io, hw]
+    for k in [1, 2, 3, 4]
+        let c = fresh()
+        c.st.insert(2, k)
+        test.assert(not wm8960.step_bias_up(dut(c)))
+    let c2 = fresh()
+    c2.st.insert(2, 1)
+    test.assert(not wm8960.step_bias_down(dut(c2)))
+    let c3 = fresh()
+    c3.st.insert(2, 2)
+    test.assert(not wm8960.step_bias_down(dut(c3)))
+
+fn formatted(c: Chip, conf: Wm8960Config)
+    test.assert(wm8960.format_set(dut(c), link(), conf, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)))
+    log_clear(c)
+
+@test
+fn test_the_outputs_come_up_muted_mixers_and_dac_before_drivers() [io, hw]
+    let c = fresh()
+    formatted(c, cfg(12000000))
+    test.assert(wm8960.step_outputs_up(dut(c), cfg(12000000)))
+    log_is(c, [lw(5, 0x008), lw(47, 0x00C), lw(34, 0x150), lw(37, 0x150), lw(26, 0x181), lw(26, 0x1E1), lw(26, 0x1F9), lw(49, 0x0F7)])
+    shadow_matches(c)
+
+@test
+fn test_a_headphone_only_board_never_touches_the_class_d_registers() [io, hw]
+    let c = fresh()
+    let hp = Wm8960Config { mclk_hz: 12000000, headphone: true, speaker: false, microphone: false,
+                            zero_cross: true }
+    test.assert(wm8960.step_outputs_up(dut(c), hp))
+    log_is(c, [lw(5, 0x008), lw(47, 0x00C), lw(34, 0x150), lw(37, 0x150), lw(26, 0x180), lw(26, 0x1E0)])
+    test.assert_eq(reg_of(c, 49), 0x037)
+
+@test
+fn test_the_inputs_come_up_and_the_pgas_are_unmuted_with_the_right_update() [io, hw]
+    let c = fresh()
+    test.assert(wm8960.step_inputs_up(dut(c)))
+    log_is(c, [lw(25, 0x03E), lw(47, 0x030), lw(0, 0x017), lw(1, 0x117)])
+    test.assert_eq(wm8960.shadow_get(1), 0x017)
+    shadow_matches(c)
+
+@test
+fn test_power_up_is_bias_then_outputs_then_inputs() [io, hw]
+    let c = fresh()
+    formatted(c, cfg(12000000))
+    test.assert(wm8960.power_set(dut(c), link(), cfg(12000000), true))
+    log_is(c, [lw(28, 0x9C), lw(25, 0x080), lp(100), lw(25, 0x0C0), lw(28, 0x08), lw(5, 0x008), lw(47, 0x00C), lw(34, 0x150), lw(37, 0x150), lw(26, 0x181), lw(26, 0x1E1), lw(26, 0x1F9), lw(49, 0x0F7), lw(25, 0x0FE), lw(47, 0x03C), lw(0, 0x017), lw(1, 0x117)])
+    shadow_matches(c)
+    test.assert(wm8960.mute_get() == Some(true))
+
+@test
+fn test_a_board_with_no_outputs_and_no_microphone_only_gets_the_bias() [io, hw]
+    let c = fresh()
+    let none = Wm8960Config { mclk_hz: 12000000, headphone: false, speaker: false, microphone: false,
+                              zero_cross: false }
+    test.assert(wm8960.step_power_up(dut(c), none))
+    log_is(c, [lw(28, 0x9C), lw(25, 0x080), lp(100), lw(25, 0x0C0), lw(28, 0x08)])
+
+@test
+fn test_power_up_without_a_format_leaves_the_class_d_outputs_off() [io, hw]
+    let c = fresh()
+    test.assert(not wm8960.step_power_up(dut(c), cfg(12000000)))
+    test.assert_eq(reg_of(c, 49), 0x037)
+    test.assert_eq(reg_of(c, 26), 0)
+
+@test
+fn test_power_down_is_the_reverse_and_stops_the_handle() [io, hw]
+    let c = fresh()
+    formatted(c, cfg(12000000))
+    test.assert(wm8960.step_power_up(dut(c), cfg(12000000)))
+    log_clear(c)
+    let l = link()
+    test.assert(wm8960.power_set(dut(c), l, cfg(12000000), false))
+    log_is(c, [lw(5, 0x008), lw(49, 0x037), lw(26, 0x181), lw(26, 0x001), lw(47, 0), lw(25, 0x0C0), lw(28, 0x9C), lw(25, 0), lw(26, 0), lw(4, 4)])
+    shadow_matches(c)
+    test.assert_eq(at(l.st, 10), 1)
+    // The clock is gone: the class-D outputs need the format again.
+    test.assert(not wm8960.step_outputs_up(dut(c), cfg(12000000)))
+
+@test
+fn test_a_power_down_that_fails_still_stops_the_handle() [io, hw]
+    let c = fresh()
+    c.st.insert(2, 1)
+    let l = link()
+    test.assert(not wm8960.power_set(dut(c), l, cfg(12000000), false))
+    test.assert_eq(at(l.st, 10), 1)
+
+@test
+fn test_a_power_up_or_down_that_is_refused_part_way_is_reported() [io, hw]
+    for k in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        let c = fresh()
+        formatted(c, cfg(12000000))
+        c.st.insert(2, at(c.st, 1) + k)
+        test.assert(not wm8960.step_power_up(dut(c), cfg(12000000)))
+    for k in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        let c = fresh()
+        formatted(c, cfg(12000000))
+        test.assert(wm8960.step_power_up(dut(c), cfg(12000000)))
+        c.st.insert(2, at(c.st, 1) + k)
+        test.assert(not wm8960.step_power_down(dut(c)))
+
+// ── Mute and gain ────────────────────────────────────────────────────
+
+@test
+fn test_mute_is_the_dacs_soft_mute_bit_and_reads_from_the_shadow() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.mute_get() == Some(true))
+    test.assert(wm8960.mute_set(d, false))
+    test.assert_eq(reg_of(c, 5), 0)
+    test.assert(wm8960.mute_get() == Some(false))
+    test.assert(wm8960.mute_set(d, true))
+    test.assert_eq(reg_of(c, 5), 0x008)
+    log_is(c, [lw(5, 0), lw(5, 0x008)])
+
+fn out_gain(c: Chip, conf: Wm8960Config, mdb: Int) -> ?MilliDb
+    wm8960.gain_set(dut(c), conf, CodecPath.CodecOutput, MilliDb { mdb: mdb })
+
+// 0 dB is code 0x79, with the zero-cross bit 0xF9; the left register is
+// written without the update bit and the right with it, then the speaker
+// pair the same way.
+@test
+fn test_the_output_volume_writes_the_headphone_and_speaker_pairs() [io, hw]
+    let c = fresh()
+    test.assert(out_gain(c, cfg(12000000), 0) == Some(MilliDb { mdb: 0 }))
+    log_is(c, [lw(2, 0x0F9), lw(3, 0x1F9), lw(40, 0x0F9), lw(41, 0x1F9)])
+    test.assert_eq(wm8960.shadow_get(3), 0x0F9)
+    shadow_matches(c)
+
+@test
+fn test_the_output_volume_steps_are_never_above_the_request() [io, hw]
+    let c = fresh()
+    let hp = Wm8960Config { mclk_hz: 1, headphone: true, speaker: false, microphone: false,
+                            zero_cross: false }
+    test.assert(out_gain(c, hp, 6000) == Some(MilliDb { mdb: 6000 }))
+    test.assert_eq(reg_of(c, 2), 0x7F)
+    test.assert(out_gain(c, hp, 9000) == Some(MilliDb { mdb: 6000 }))
+    test.assert(out_gain(c, hp, -73000) == Some(MilliDb { mdb: -73000 }))
+    test.assert_eq(reg_of(c, 2), 0x30)
+    test.assert(out_gain(c, hp, -72500) == Some(MilliDb { mdb: -73000 }))
+    test.assert(out_gain(c, hp, -1) == Some(MilliDb { mdb: -1000 }))
+    test.assert_eq(reg_of(c, 2), 0x78)
+    test.assert_eq(reg_of(c, 40), 0)
+    test.assert(out_gain(c, hp, -73001) == None)
+
+@test
+fn test_the_output_gain_reads_back_and_the_analogue_mute_reads_as_the_lowest_step() [io, hw]
+    let c = fresh()
+    test.assert(wm8960.gain_get(CodecPath.CodecOutput) == Some(MilliDb { mdb: -73000 }))
+    test.assert(out_gain(c, cfg(1), 6000) == Some(MilliDb { mdb: 6000 }))
+    test.assert(wm8960.gain_get(CodecPath.CodecOutput) == Some(MilliDb { mdb: 6000 }))
+    test.assert_eq(wm8960.out_mdb(0x2F), -73000)
+    test.assert_eq(wm8960.out_mdb(0x79), 0)
+    test.assert(wm8960.out_code(MilliDb { mdb: -74000 }) == None)
+
+fn in_gain(c: Chip, conf: Wm8960Config, mdb: Int) -> ?MilliDb
+    wm8960.gain_set(dut(c), conf, CodecPath.CodecInput, MilliDb { mdb: mdb })
+
+// The input PGA is -17.25 dB to +30 dB in 0.75 dB steps: 0 dB is code 23,
+// and the zero-cross bit of this register is bit 6, not the mute bit 7.
+@test
+fn test_the_input_gain_is_the_pga_in_three_quarter_decibel_steps() [io, hw]
+    let c = fresh()
+    test.assert(in_gain(c, cfg(1), 0) == Some(MilliDb { mdb: 0 }))
+    log_is(c, [lw(0, 0x057), lw(1, 0x157)])
+    test.assert_eq(reg_of(c, 0) & 0x80, 0)
+    test.assert(in_gain(c, cfg(1), 30000) == Some(MilliDb { mdb: 30000 }))
+    test.assert_eq(reg_of(c, 0) & 0x3F, 63)
+    test.assert(in_gain(c, cfg(1), -17250) == Some(MilliDb { mdb: -17250 }))
+    test.assert_eq(reg_of(c, 0) & 0x3F, 0)
+    test.assert(in_gain(c, cfg(1), 100) == Some(MilliDb { mdb: 0 }))
+    test.assert(in_gain(c, cfg(1), -17251) == None)
+    test.assert(wm8960.gain_get(CodecPath.CodecInput) == Some(MilliDb { mdb: 0 }))
+    test.assert_eq(wm8960.in_mdb(63), 30000)
+    test.assert(wm8960.in_code(MilliDb { mdb: 40000 }) == Some(63))
+
+@test
+fn test_the_input_gain_without_zero_cross_sets_no_zero_cross_bit() [io, hw]
+    let c = fresh()
+    let plain = Wm8960Config { mclk_hz: 1, headphone: true, speaker: false, microphone: true,
+                               zero_cross: false }
+    test.assert(in_gain(c, plain, 0) == Some(MilliDb { mdb: 0 }))
+    log_is(c, [lw(0, 0x017), lw(1, 0x117)])
+
+@test
+fn test_a_gain_with_an_empty_shadow_or_a_refused_write_sets_nothing() [io, hw]
+    wm8960.shadow_clear()
+    let c = chip()
+    test.assert(out_gain(c, cfg(1), 0) == None)
+    test.assert(in_gain(c, cfg(1), 0) == None)
+    test.assert_eq(at(c.st, 9), 0)
+    for k in [1, 2, 3, 4]
+        let c2 = fresh()
+        c2.st.insert(2, k)
+        test.assert(out_gain(c2, cfg(1), 0) == None)
+    for k in [1, 2]
+        let c3 = fresh()
+        c3.st.insert(2, k)
+        test.assert(in_gain(c3, cfg(1), 0) == None)
+
+// ── Settings the traits have no place for ────────────────────────────
+
+@test
+fn test_the_dac_and_adc_digital_volumes() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.dac_volume_set(d, MilliDb { mdb: 0 }) == Some(MilliDb { mdb: 0 }))
+    log_is(c, [lw(10, 0x0FF), lw(11, 0x1FF)])
+    test.assert(wm8960.dac_volume_set(d, MilliDb { mdb: -127000 }) == Some(MilliDb { mdb: -127000 }))
+    test.assert_eq(reg_of(c, 10), 1)
+    test.assert(wm8960.dac_volume_set(d, MilliDb { mdb: -127500 }) == None)
+    log_clear(c)
+    test.assert(wm8960.adc_volume_set(d, MilliDb { mdb: 30000 }) == Some(MilliDb { mdb: 30000 }))
+    log_is(c, [lw(21, 0x0FF), lw(22, 0x1FF)])
+    test.assert(wm8960.adc_volume_set(d, MilliDb { mdb: -97000 }) == Some(MilliDb { mdb: -97000 }))
+    test.assert_eq(reg_of(c, 21), 1)
+    test.assert(wm8960.adc_volume_set(d, MilliDb { mdb: -98000 }) == None)
+    shadow_matches(c)
+
+@test
+fn test_the_digital_volumes_refuse_an_empty_shadow_and_a_refused_write() [io, hw]
+    wm8960.shadow_clear()
+    let c = chip()
+    test.assert(wm8960.dac_volume_set(dut(c), MilliDb { mdb: 0 }) == None)
+    test.assert(wm8960.adc_volume_set(dut(c), MilliDb { mdb: 0 }) == None)
+    for k in [1, 2]
+        let c2 = fresh()
+        c2.st.insert(2, k)
+        test.assert(wm8960.dac_volume_set(dut(c2), MilliDb { mdb: 0 }) == None)
+        let c3 = fresh()
+        c3.st.insert(2, k)
+        test.assert(wm8960.adc_volume_set(dut(c3), MilliDb { mdb: 0 }) == None)
+
+@test
+fn test_the_headphone_and_speaker_volumes_alone() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.headphone_volume_set(d, cfg(1), MilliDb { mdb: -10000 }) == Some(MilliDb { mdb: -10000 }))
+    log_is(c, [lw(2, 0x0EF), lw(3, 0x1EF)])
+    test.assert(wm8960.speaker_volume_set(d, cfg(1), MilliDb { mdb: -10000 }) == Some(MilliDb { mdb: -10000 }))
+    log_is(c, [lw(40, 0x0EF), lw(41, 0x1EF)])
+    test.assert(wm8960.headphone_volume_set(d, cfg(1), MilliDb { mdb: -80000 }) == None)
+    test.assert(wm8960.speaker_volume_set(d, cfg(1), MilliDb { mdb: -80000 }) == None)
+    wm8960.shadow_clear()
+    test.assert(wm8960.headphone_volume_set(d, cfg(1), MilliDb { mdb: 0 }) == None)
+    test.assert(wm8960.speaker_volume_set(d, cfg(1), MilliDb { mdb: 0 }) == None)
+    for k in [1, 2]
+        let c2 = fresh()
+        c2.st.insert(2, k)
+        test.assert(wm8960.headphone_volume_set(dut(c2), cfg(1), MilliDb { mdb: 0 }) == None)
+        let c3 = fresh()
+        c3.st.insert(2, k)
+        test.assert(wm8960.speaker_volume_set(dut(c3), cfg(1), MilliDb { mdb: 0 }) == None)
+
+@test
+fn test_the_microphone_boost_is_0_13_20_or_29_db_on_both_channels() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.mic_boost_set(d, MilliDb { mdb: 29000 }) == Some(MilliDb { mdb: 29000 }))
+    log_is(c, [lw(32, 0x130), lw(33, 0x130)])
+    test.assert(wm8960.mic_boost_set(d, MilliDb { mdb: 25000 }) == Some(MilliDb { mdb: 20000 }))
+    test.assert_eq(reg_of(c, 32), 0x120)
+    test.assert(wm8960.mic_boost_set(d, MilliDb { mdb: 13000 }) == Some(MilliDb { mdb: 13000 }))
+    test.assert_eq(reg_of(c, 33), 0x110)
+    test.assert(wm8960.mic_boost_set(d, MilliDb { mdb: 12999 }) == Some(MilliDb { mdb: 0 }))
+    test.assert_eq(reg_of(c, 32), 0x100)
+    test.assert(wm8960.mic_boost_set(d, MilliDb { mdb: -1 }) == None)
+    c.st.insert(2, at(c.st, 1) + 1)
+    test.assert(wm8960.mic_boost_set(d, MilliDb { mdb: 29000 }) == None)
+
+@test
+fn test_the_microphone_bias_and_the_differential_input() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.mic_bias_set(d, true))
+    test.assert_eq(reg_of(c, 48), 0x003)
+    test.assert(wm8960.mic_bias_set(d, false))
+    test.assert_eq(reg_of(c, 48), 0x002)
+    test.assert(wm8960.mic_differential_set(d, false))
+    test.assert_eq(reg_of(c, 32), 0x140)
+    test.assert_eq(reg_of(c, 33), 0x140)
+    test.assert(wm8960.mic_differential_set(d, true))
+    test.assert_eq(reg_of(c, 32), 0x180)
+
+@test
+fn test_the_speaker_boost_is_refused_while_the_speaker_outputs_are_on() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.speaker_boost_set(d, 3))
+    test.assert_eq(reg_of(c, 51), 0x09B)
+    test.assert(not wm8960.speaker_boost_set(d, 6))
+    test.assert(not wm8960.speaker_boost_set(d, -1))
+    test.assert(wm8960.reg_write(d, 49, 0x0F7))
+    test.assert(not wm8960.speaker_boost_set(d, 1))
+    wm8960.shadow_clear()
+    test.assert(not wm8960.speaker_boost_set(d, 1))
+
+@test
+fn test_dsp_mode_a_and_b_and_the_loopback() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.dsp_format_set(d, false, 16, false))
+    test.assert_eq(reg_of(c, 7), 0x003)
+    test.assert(wm8960.dsp_format_set(d, true, 24, true))
+    test.assert_eq(reg_of(c, 7), 0x05B)
+    test.assert(not wm8960.dsp_format_set(d, false, 8, false))
+    c.st.insert(2, at(c.st, 1) + 1)
+    test.assert(not wm8960.dsp_format_set(d, false, 16, false))
+    test.assert(wm8960.loopback_set(dut(chip()), true))
+    test.assert_eq(wm8960.shadow_get(9), 1)
+    test.assert(wm8960.loopback_set(dut(chip()), false))
+    test.assert_eq(wm8960.shadow_get(9), 0)
+
+@test
+fn test_the_discharge_sets_disop_for_the_time_given_and_clears_it() [io, hw]
+    let c = fresh()
+    let d = dut(c)
+    test.assert(wm8960.discharge(d, 0, 400))
+    log_is(c, [lw(29, 0x040), lp(400), lw(29, 0)])
+    test.assert(wm8960.discharge(d, 3, 10))
+    log_is(c, [lw(29, 0x070), lp(10), lw(29, 0)])
+    test.assert(not wm8960.discharge(d, 4, 10))
+    test.assert(not wm8960.discharge(d, -1, 10))
+    c.st.insert(2, at(c.st, 1) + 1)
+    test.assert(not wm8960.discharge(d, 0, 10))
+
+// ── The type over absent hardware ────────────────────────────────────
+
+fn absent() -> wm8960.Wm8960<Link>
+    wm8960.attach(BoardI2c { id: 0 }, dev_bus.wiring_i2c(0, 0x1A), link(), cfg(12000000))
+
+@test
+fn test_the_type_over_absent_hardware_answers_as_a_part_that_is_not_there() [io, hw]
+    wm8960.shadow_clear()
+    let p = absent()
+    test.assert(not p.begin())
+    test.assert(not p.present())
+    test.assert_eq(p.reg(0), -1)
+    test.assert(not p.set_reg(0, 1))
+    test.assert(p.set_dac_volume(MilliDb { mdb: 0 }) == None)
+    test.assert(p.set_adc_volume(MilliDb { mdb: 0 }) == None)
+    test.assert(p.set_headphone_volume(MilliDb { mdb: 0 }) == None)
+    test.assert(p.set_speaker_volume(MilliDb { mdb: 0 }) == None)
+    test.assert(p.set_mic_boost(MilliDb { mdb: 0 }) == None)
+    test.assert(not p.set_mic_bias(true))
+    test.assert(not p.set_speaker_boost(1))
+    test.assert(not p.set_dsp_format(false, 16, false))
+    test.assert(p.codec_is_muted() == None)
+    test.assert(p.codec_gain(CodecPath.CodecOutput) == None)
+    test.assert(p.codec_gain(CodecPath.CodecInput) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecOutput, MilliDb { mdb: 0 }) == None)
+    test.assert(p.codec_set_gain(CodecPath.CodecInput, MilliDb { mdb: 0 }) == None)
+    test.assert(not p.codec_set_mute(true))
+
+@test
+fn test_power_and_format_on_absent_hardware_report_false() [io, hw]
+    wm8960.shadow_reset()
+    let p = absent()
+    test.assert(not p.codec_set_power(true))
+    test.assert(not p.codec_set_power(false))
+    let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
+    test.assert(not p.codec_set_format(f))
+    p.i2s_stop()
+
+// The real pause is the board's timer; one millisecond is waited here.
+@test
+fn test_the_pause_of_the_type_waits_on_the_boards_timer() [io, hw]
+    absent().pause_ms(1)
+    test.assert(true)
+
+@test
+fn test_the_default_configuration() [io]
+    let c = wm8960.config_default(24000000)
+    test.assert_eq(c.mclk_hz, 24000000)
+    test.assert(c.headphone and c.speaker and c.microphone and c.zero_cross)
+
+// ── The steps by name ────────────────────────────────────────────────
+
+@test
+fn test_the_base_step_enables_the_timeout_only_with_zero_cross() [io, hw]
+    let c = fresh()
+    test.assert(wm8960.step_base(dut(c), cfg(12000000)))
+    log_is(c, [lw(23, 0x1C1)])
+    let plain = Wm8960Config { mclk_hz: 1, headphone: true, speaker: true, microphone: true,
+                               zero_cross: false }
+    test.assert(wm8960.step_base(dut(c), plain))
+    test.assert_eq(at(c.st, 9), 0)
+
+@test
+fn test_the_interface_step_sets_master_word_length_and_format() [io, hw]
+    let c = fresh()
+    test.assert(wm8960.step_interface(dut(c), true, 3, 2))
+    log_is(c, [lw(7, 0x04E)])
+    test.assert(wm8960.step_interface(dut(c), false, 0, 1))
+    log_is(c, [lw(7, 0x001)])
+    shadow_matches(c)
+
+@test
+fn test_the_clock_step_with_and_without_the_pll() [io, hw]
+    let c = fresh()
+    match wm8960.plan_of(12000000, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
+        Some(p) => test.assert(wm8960.step_clocks(dut(c), p, false))
+        None => test.assert(false)
+    log_is(c, [lw(26, 0), lw(4, 4), lw(52, 0x28), lw(53, 0x31), lw(54, 0x26), lw(55, 0xE9), lw(26, 1), lp(250), lw(4, 5), lw(8, 0x1C0)])
+    let c2 = fresh()
+    match wm8960.plan_of(11289600, fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, true))
+        Some(p) => test.assert(wm8960.step_clocks(dut(c2), p, true))
+        None => test.assert(false)
+    log_is(c2, [lw(26, 0), lw(4, 0), lw(8, 0x1C7)])
