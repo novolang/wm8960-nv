@@ -53,8 +53,8 @@ I2S handle.
   wait, and the longer is taken.
 - Table 45 of the data sheet and its worked example differ by one in K for the
   12 MHz to 12.288 MHz row; the formula is taken.
-- The manifest names devices-nv and embedded-hal-nv by path: `AudioCodec` and
-  `I2s` are in the 0.3.3 releases, which are not on the registry.
+- The manifest names devices-nv and embedded-hal-nv by the registry range
+  `^0.3.3`, the first releases with `AudioCodec` and `I2s`.
 - Not implemented: the ALC, limiter and noise gate, 3D enhancement,
   de-emphasis, companding, jack detection, thermal shutdown, the 20-bit word
   length, the right-justified format, OUT3 and the mono output,

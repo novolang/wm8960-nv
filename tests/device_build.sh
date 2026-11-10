@@ -11,9 +11,7 @@
 # block and I2C bus to drive, and its first line must be the program's
 # refusal.
 #
-# While devices-nv and embedded-hal-nv 0.3.3 are not on the registry, this
-# package's manifest names them by path, and the scratch package does the
-# same.  Run from anywhere:  bash tests/device_build.sh
+# Run from anywhere:  bash tests/device_build.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG="$(cd "$HERE/.." && pwd)"
@@ -21,14 +19,6 @@ NOVO="${NOVO:-$HOME/.novo/bin/novo}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/wm8960-nv-dev.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
-
-if grep -q '^devices-nv *= *{ *path' "$PKG/novo.toml"; then
-  DEPS="devices-nv      = { path = \"$PKG/../devices-nv\" }
-embedded-hal-nv = { path = \"$PKG/../embedded-hal-nv\" }"
-else
-  DEPS='devices-nv      = "^0.3.3"
-embedded-hal-nv = "^0.3.3"'
-fi
 
 mkdir -p "$WORK/src"
 cp "$PKG/examples/playback.nv" "$WORK/src/main.nv"
@@ -40,7 +30,8 @@ main    = "src/main.nv"
 
 [dependencies]
 wm8960-nv = { path = "$PKG" }
-$DEPS
+devices-nv      = "^0.3.3"
+embedded-hal-nv = "^0.3.3"
 EOF
 
 fail=0

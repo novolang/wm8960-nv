@@ -27,6 +27,6 @@ tier = "embedded"
 [dependencies]
 # The board's I2C handle, the I2cBus, Timer and I2s traits and the I2S
 # settings.
-embedded-hal-nv = { path = "../embedded-hal-nv" }
+embedded-hal-nv = "^0.3.3"
 # The wiring record, the register helpers, and the AudioCodec trait.
-devices-nv      = { path = "../devices-nv" }
+devices-nv      = "^0.3.3"
