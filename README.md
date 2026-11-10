@@ -16,6 +16,20 @@ against a double of the part and a double of the I2S handle, in the host
 suite. The device program below builds for the nRF52840-DK and the
 nRF54LM20-DK against a stand-in handle and has not been flashed.
 
+## Install
+
+```sh
+novo pkg add wm8960-nv
+```
+
+The device program is `examples/playback.nv`.  Make it the `main` of a package that
+depends on this one and build it for a board:
+
+```sh
+novo build --target=nrf52840-dk src/main.nv
+novo build --target=nrf54lm20-dk src/main.nv
+```
+
 ## The device program
 
 `examples/playback.nv` brings the codec up and plays a square wave of 441 Hz

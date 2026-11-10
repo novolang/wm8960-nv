@@ -79,7 +79,7 @@ fn square(var buf: Vec[i32; 256])
     buf.clear()
     for i in 0..128
         var v = 8192
-        if (i / 50) % 2 == 1
+        if i / 50 % 2 == 1
             v = 0 - 8192
         let _ = buf.push(v as i32)
         let _ = buf.push(v as i32)

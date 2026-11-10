@@ -459,7 +459,7 @@ fn pll_is(mclk: Int, sysclk: Int, pre: Int, n: Int, k: Int)
             test.assert_eq(p.k, k)
             test.assert(p.pll)
             test.assert_eq(p.sysdiv, 2)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 // The formula of the data sheet, K = int(2^24 x (R - N)), for the clocks of
 // the task: 12 MHz and 24 MHz to 44.1 and 48 kHz.  R is 7.5264 and 8.192;
@@ -479,7 +479,7 @@ fn table45(mclk: Int, sysclk: Int, pre: Int, n: Int, k: Int)
             test.assert_eq(p.n, n)
             let d = p.k - k
             test.assert(d >= -1 and d <= 1)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 // Table 45 of the data sheet: prescale, N and a K that the formula matches
 // within one count, the last digit of several rows being a count off.
@@ -518,18 +518,18 @@ fn test_the_plan_uses_mclk_directly_when_it_is_sysclk_or_twice_it() [io]
             test.assert_eq(p.adcdiv, 0)
             test.assert_eq(p.dclkdiv, 7)
             test.assert_eq(p.sysclk, 12288000)
-        None => test.assert(false)
+        None    => test.assert(false)
     match wm8960.plan_of(24576000, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
         Some(p) =>
             test.assert(not p.pll)
             test.assert_eq(p.sysdiv, 2)
-        None => test.assert(false)
+        None    => test.assert(false)
     match wm8960.plan_of(12000000, fmt_of(8000, 16, 2, AudioFraming.AudioPhilips, false))
         Some(p) =>
             test.assert(p.pll)
             test.assert_eq(p.adcdiv, 6)
             test.assert_eq(p.n, 8)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_a_format_the_codec_cannot_make_has_no_plan() [io]
@@ -570,7 +570,17 @@ fn test_48_khz_32_bit_slave_from_12_mhz_through_the_pll() [io, hw]
     let l = link()
     let f = fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false)
     test.assert(wm8960.format_set(dut(c), l, cfg(12000000), f))
-    log_is(c, [lw(7, 0x00E), lw(26, 0), lw(4, 4), lw(52, 0x28), lw(53, 0x31), lw(54, 0x26), lw(55, 0xE9), lw(26, 1), lp(250), lw(4, 5), lw(8, 0x1C0)])
+    log_is(c, [lw(7, 0x00E),
+        lw(26, 0),
+        lw(4, 4),
+        lw(52, 0x28),
+        lw(53, 0x31),
+        lw(54, 0x26),
+        lw(55, 0xE9),
+        lw(26, 1),
+        lp(250),
+        lw(4, 5),
+        lw(8, 0x1C0)])
     shadow_matches(c)
     test.assert_eq(at(l.st, 0), 1)
     test.assert_eq(at(l.st, 1), 48000)
@@ -586,7 +596,17 @@ fn test_44_1_khz_from_24_mhz_halves_mclk_before_the_pll() [io, hw]
     let f = fmt_of(44100, 16, 2, AudioFraming.AudioLeftJustified, false)
     let l = link()
     test.assert(wm8960.format_set(dut(c), l, cfg(24000000), f))
-    log_is(c, [lw(7, 0x001), lw(26, 0), lw(4, 4), lw(52, 0x37), lw(53, 0x86), lw(54, 0xC2), lw(55, 0x26), lw(26, 1), lp(250), lw(4, 5), lw(8, 0x1C0)])
+    log_is(c, [lw(7, 0x001),
+        lw(26, 0),
+        lw(4, 4),
+        lw(52, 0x37),
+        lw(53, 0x86),
+        lw(54, 0xC2),
+        lw(55, 0x26),
+        lw(26, 1),
+        lp(250),
+        lw(4, 5),
+        lw(8, 0x1C0)])
     test.assert_eq(at(l.st, 5), 1)
     shadow_matches(c)
 
@@ -703,7 +723,14 @@ fn test_the_outputs_come_up_muted_mixers_and_dac_before_drivers() [io, hw]
     let c = fresh()
     formatted(c, cfg(12000000))
     test.assert(wm8960.step_outputs_up(dut(c), cfg(12000000)))
-    log_is(c, [lw(5, 0x008), lw(47, 0x00C), lw(34, 0x150), lw(37, 0x150), lw(26, 0x181), lw(26, 0x1E1), lw(26, 0x1F9), lw(49, 0x0F7)])
+    log_is(c, [lw(5, 0x008),
+        lw(47, 0x00C),
+        lw(34, 0x150),
+        lw(37, 0x150),
+        lw(26, 0x181),
+        lw(26, 0x1E1),
+        lw(26, 0x1F9),
+        lw(49, 0x0F7)])
     shadow_matches(c)
 
 @test
@@ -728,7 +755,23 @@ fn test_power_up_is_bias_then_outputs_then_inputs() [io, hw]
     let c = fresh()
     formatted(c, cfg(12000000))
     test.assert(wm8960.power_set(dut(c), link(), cfg(12000000), true))
-    log_is(c, [lw(28, 0x9C), lw(25, 0x080), lp(100), lw(25, 0x0C0), lw(28, 0x08), lw(5, 0x008), lw(47, 0x00C), lw(34, 0x150), lw(37, 0x150), lw(26, 0x181), lw(26, 0x1E1), lw(26, 0x1F9), lw(49, 0x0F7), lw(25, 0x0FE), lw(47, 0x03C), lw(0, 0x017), lw(1, 0x117)])
+    log_is(c, [lw(28, 0x9C),
+        lw(25, 0x080),
+        lp(100),
+        lw(25, 0x0C0),
+        lw(28, 0x08),
+        lw(5, 0x008),
+        lw(47, 0x00C),
+        lw(34, 0x150),
+        lw(37, 0x150),
+        lw(26, 0x181),
+        lw(26, 0x1E1),
+        lw(26, 0x1F9),
+        lw(49, 0x0F7),
+        lw(25, 0x0FE),
+        lw(47, 0x03C),
+        lw(0, 0x017),
+        lw(1, 0x117)])
     shadow_matches(c)
     test.assert(wm8960.mute_get() == Some(true))
 
@@ -755,7 +798,16 @@ fn test_power_down_is_the_reverse_and_stops_the_handle() [io, hw]
     log_clear(c)
     let l = link()
     test.assert(wm8960.power_set(dut(c), l, cfg(12000000), false))
-    log_is(c, [lw(5, 0x008), lw(49, 0x037), lw(26, 0x181), lw(26, 0x001), lw(47, 0), lw(25, 0x0C0), lw(28, 0x9C), lw(25, 0), lw(26, 0), lw(4, 4)])
+    log_is(c, [lw(5, 0x008),
+        lw(49, 0x037),
+        lw(26, 0x181),
+        lw(26, 0x001),
+        lw(47, 0),
+        lw(25, 0x0C0),
+        lw(28, 0x9C),
+        lw(25, 0),
+        lw(26, 0),
+        lw(4, 4)])
     shadow_matches(c)
     test.assert_eq(at(l.st, 10), 1)
     // The clock is gone: the class-D outputs need the format again.
@@ -1084,10 +1136,19 @@ fn test_the_clock_step_with_and_without_the_pll() [io, hw]
     let c = fresh()
     match wm8960.plan_of(12000000, fmt_of(48000, 32, 2, AudioFraming.AudioPhilips, false))
         Some(p) => test.assert(wm8960.step_clocks(dut(c), p, false))
-        None => test.assert(false)
-    log_is(c, [lw(26, 0), lw(4, 4), lw(52, 0x28), lw(53, 0x31), lw(54, 0x26), lw(55, 0xE9), lw(26, 1), lp(250), lw(4, 5), lw(8, 0x1C0)])
+        None    => test.assert(false)
+    log_is(c, [lw(26, 0),
+        lw(4, 4),
+        lw(52, 0x28),
+        lw(53, 0x31),
+        lw(54, 0x26),
+        lw(55, 0xE9),
+        lw(26, 1),
+        lp(250),
+        lw(4, 5),
+        lw(8, 0x1C0)])
     let c2 = fresh()
     match wm8960.plan_of(11289600, fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, true))
         Some(p) => test.assert(wm8960.step_clocks(dut(c2), p, true))
-        None => test.assert(false)
+        None    => test.assert(false)
     log_is(c2, [lw(26, 0), lw(4, 0), lw(8, 0x1C7)])

@@ -114,10 +114,10 @@ let R_PLL4    = 0x37
 
 // The number of registers, and the shadow's layout: the registers, then
 // three flags.
-let REG_COUNT  = 56
-let SH_LEN     = 64
-let SH_FORMAT  = 56
-let SH_DISCH   = 57
+let REG_COUNT = 56
+let SH_LEN    = 64
+let SH_FORMAT = 56
+let SH_DISCH  = 57
 
 // Bits.
 let VU          = 0x100
@@ -157,9 +157,9 @@ let PLL_MS       = 250
 let DISCHARGE_MS = 600
 
 // The 7-bit address, and the class-D clock window in hertz.
-let ADDR_WM8960 = 0x1A
-let DCLK_MIN_HZ = 700000
-let DCLK_MAX_HZ = 800000
+let ADDR_WM8960  = 0x1A
+let DCLK_MIN_HZ  = 700000
+let DCLK_MAX_HZ  = 800000
 let DCLK_BEST_HZ = 768000
 
 // The data sheet's reset values of R0 to R55 (Register Map).
@@ -658,7 +658,8 @@ pub fn probe<P: Wm8960Port>(p: P) -> Bool [hw, mutate]
 // I2S handle for it: the plan found, the handle configured and enabled (the
 // PLL needs MCLK to run), then the interface, and the clocks.  The shadow
 // then records that the class-D outputs have a valid clock.
-pub fn format_set<P: Wm8960Port, S: I2s>(p: P, i2s: S, c: Wm8960Config, f: AudioFormat) -> Bool [hw, mutate]
+pub fn format_set<P: Wm8960Port, S: I2s>(p: P, i2s: S, c: Wm8960Config,
+                                         f: AudioFormat) -> Bool [hw, mutate]
     let found = plan_of(c.mclk_hz, f)
     let Some(plan) = found else return false
     if not shadow_ready()
@@ -675,7 +676,8 @@ pub fn format_set<P: Wm8960Port, S: I2s>(p: P, i2s: S, c: Wm8960Config, f: Audio
 // Powers the converters up or down.  Up is `step_power_up` and leaves the DAC
 // soft-muted; down is `step_power_down`, after which the board's I2S handle
 // is disabled.
-pub fn power_set<P: Wm8960Port, S: I2s>(p: P, i2s: S, c: Wm8960Config, on: Bool) -> Bool [hw, mutate]
+pub fn power_set<P: Wm8960Port, S: I2s>(p: P, i2s: S, c: Wm8960Config,
+                                        on: Bool) -> Bool [hw, mutate]
     if on
         return step_power_up(p, c)
     let ok = step_power_down(p)
@@ -726,7 +728,8 @@ pub fn in_mdb(code: Int) -> Int
 // the right with it, so the two change together.  `zcbit` is the zero-cross
 // bit of the registers, or 0 for none: bit 7 of the output volumes, bit 6 of
 // the input PGAs, whose bit 7 is the mute.
-fn pair_write<P: Wm8960Port>(p: P, left: Int, right: Int, code: Int, zcbit: Int) -> Bool [hw, mutate]
+fn pair_write<P: Wm8960Port>(p: P, left: Int, right: Int, code: Int,
+                             zcbit: Int) -> Bool [hw, mutate]
     reg_write(p, left, code | zcbit) and reg_write(p, right, code | zcbit | VU)
 
 // The zero-cross bit of the output volumes and of the input PGAs for a
@@ -745,10 +748,11 @@ fn in_zc(c: Wm8960Config) -> Int
 // speaker drivers to the largest step at or below `g`; the input PGAs to the
 // largest step at or below `g`.  The gain set, or `None` when `g` is below the
 // path's range or the part did not take it.
-pub fn gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, path: CodecPath, g: MilliDb) -> ?MilliDb [hw, mutate]
+pub fn gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, path: CodecPath,
+                               g: MilliDb) -> ?MilliDb [hw, mutate]
     match path
         CodecPath.CodecOutput => out_gain_set(p, c, g)
-        CodecPath.CodecInput => in_gain_set(p, c, g)
+        CodecPath.CodecInput  => in_gain_set(p, c, g)
 
 fn out_gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
     let Some(code) = out_code(g) else return None
@@ -829,7 +833,8 @@ pub fn speaker_volume_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?
     Some(MilliDb { mdb: out_mdb(code) })
 
 // The headphone volume alone, by the same rule.
-pub fn headphone_volume_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
+pub fn headphone_volume_set<P: Wm8960Port>(p: P, c: Wm8960Config,
+                                           g: MilliDb) -> ?MilliDb [hw, mutate]
     let Some(code) = out_code(g) else return None
     if shadow_get(R_LOUT1) < 0
         return None
