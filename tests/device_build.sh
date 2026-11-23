@@ -30,8 +30,8 @@ main    = "src/main.nv"
 
 [dependencies]
 wm8960-nv = { path = "$PKG" }
-devices-nv      = "^0.3.3"
-embedded-hal-nv = "^0.3.3"
+devices-nv      = "^0.4.0"
+embedded-hal-nv = "^0.4.0"
 EOF
 
 fail=0

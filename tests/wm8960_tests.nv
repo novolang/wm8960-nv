@@ -189,7 +189,7 @@ impl I2s for Link
 
 fn fmt_of(rate: Int, depth: Int, ch: Int, framing: AudioFraming, master: Bool) -> AudioFormat
     AudioFormat { sample_rate: rate, bit_depth: depth, channels: ch, framing: framing,
-                  codec_is_master: master }
+                  codec_is_master: master, slot_bits: 0 }
 
 fn cfg(mclk: Int) -> Wm8960Config
     wm8960.config_default(mclk)
@@ -538,6 +538,7 @@ fn test_a_format_the_codec_cannot_make_has_no_plan() [io]
     test.assert(wm8960.plan_of(m, fmt_of(20000, 32, 2, AudioFraming.AudioPhilips, false)) == None)
     test.assert(wm8960.plan_of(m, fmt_of(48000, 8, 2, AudioFraming.AudioPhilips, false)) == None)
     test.assert(wm8960.plan_of(m, fmt_of(48000, 16, 3, AudioFraming.AudioPhilips, false)) == None)
+    test.assert(wm8960.plan_of(m, fmt_of(48000, 16, 2, AudioFraming.AudioDspA, false)) == None)
     test.assert(wm8960.plan_of(0, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)) == None)
     test.assert(wm8960.plan_of(4000000, fmt_of(48000, 16, 2, AudioFraming.AudioPhilips, false)) == None)
     // 24-bit stereo is a bit clock of 48 fs, no whole division of SYSCLK, so
@@ -553,12 +554,23 @@ fn test_the_word_length_format_and_i2s_codes() [io]
     test.assert_eq(wm8960.wl_code(8), -1)
     test.assert_eq(wm8960.fmt_code(AudioFraming.AudioPhilips), 2)
     test.assert_eq(wm8960.fmt_code(AudioFraming.AudioLeftJustified), 1)
+    // The framings the interface has no code for.
+    test.assert_eq(wm8960.fmt_code(AudioFraming.AudioRightJustified), -1)
+    test.assert_eq(wm8960.fmt_code(AudioFraming.AudioDspA), -1)
+    test.assert_eq(wm8960.fmt_code(AudioFraming.AudioDspB), -1)
+    test.assert_eq(wm8960.fmt_code(AudioFraming.AudioPdm), -1)
     let a = wm8960.i2s_config_of(fmt_of(44100, 16, 2, AudioFraming.AudioPhilips, false))
     test.assert(a.role == I2sRole.I2sMaster)
     test.assert(a.format == I2sFormat.I2sPhilips)
     let b = wm8960.i2s_config_of(fmt_of(44100, 16, 2, AudioFraming.AudioLeftJustified, true))
     test.assert(b.role == I2sRole.I2sSlave)
     test.assert(b.format == I2sFormat.I2sLeftJustified)
+    // The slot is the format's.
+    test.assert_eq(a.slot_bits, 0)
+    let wide = AudioFormat { sample_rate: 44100, bit_depth: 16, channels: 2,
+                             framing: AudioFraming.AudioPhilips, codec_is_master: false,
+                             slot_bits: 32 }
+    test.assert_eq(wm8960.i2s_config_of(wide).slot_bits, 32)
 
 // ── The format ───────────────────────────────────────────────────────
 
@@ -885,6 +897,9 @@ fn test_the_output_gain_reads_back_and_the_analogue_mute_reads_as_the_lowest_ste
     test.assert(wm8960.gain_get(CodecPath.CodecOutput) == Some(MilliDb { mdb: -73000 }))
     test.assert(out_gain(c, cfg(1), 6000) == Some(MilliDb { mdb: 6000 }))
     test.assert(wm8960.gain_get(CodecPath.CodecOutput) == Some(MilliDb { mdb: 6000 }))
+    // The paths the part does not name answer `None`.
+    test.assert(wm8960.gain_get(CodecPath.CodecSpeaker) == None)
+    test.assert(wm8960.gain_set(dut(c), cfg(1), CodecPath.CodecHeadphone, MilliDb { mdb: 0 }) == None)
     test.assert_eq(wm8960.out_mdb(0x2F), -73000)
     test.assert_eq(wm8960.out_mdb(0x79), 0)
     test.assert(wm8960.out_code(MilliDb { mdb: -74000 }) == None)

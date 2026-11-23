@@ -446,11 +446,11 @@ pub fn pll_plan(mclk: Int, sysclk: Int) -> ?ClockPlan
 
 // The clock plan for a format and a master clock, or `None` when the codec
 // cannot make it: a rate that is not one of the nine, a depth other than 16,
-// 24 or 32, an MCLK the PLL cannot use, a SYSCLK for which no class-D
+// 24 or 32, a framing `fmt_code` has no code for, an MCLK the PLL cannot use, a SYSCLK for which no class-D
 // divider gives 700 to 800 kHz, or, with the codec as master, a bit clock
 // that is not a whole division of SYSCLK.
 pub fn plan_of(mclk_hz: Int, f: AudioFormat) -> ?ClockPlan
-    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0 or mclk_hz <= 0
+    if not dev_audio.audio_format_valid(f) or wl_code(f.bit_depth) < 0 or fmt_code(f.framing) < 0 or mclk_hz <= 0
         return None
     let sysclk = sysclk_of(f.sample_rate)
     if sysclk == 0
@@ -487,11 +487,12 @@ pub fn wl_code(depth: Int) -> Int
     -1
 
 // The format code of a framing (R7 bits 1:0): 2 for I2S, 1 for
-// left-justified.
+// left-justified, and -1 for a framing the interface has no code for.
 pub fn fmt_code(f: AudioFraming) -> Int
     match f
         AudioFraming.AudioPhilips       => 2
         AudioFraming.AudioLeftJustified => 1
+        _                               => -1
 
 // The I2S settings for a format.
 pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
@@ -502,7 +503,7 @@ pub fn i2s_config_of(f: AudioFormat) -> I2sConfig
     if f.framing == AudioFraming.AudioLeftJustified
         layout = I2sFormat.I2sLeftJustified
     I2sConfig { sample_rate: f.sample_rate, bit_depth: f.bit_depth, channels: f.channels,
-                role: role, format: layout }
+                role: role, format: layout, slot_bits: f.slot_bits }
 
 // ── The named steps ──────────────────────────────────────────────────
 
@@ -747,12 +748,14 @@ fn in_zc(c: Wm8960Config) -> Int
 // Sets the output volume of the headphone and, when powered for it, the
 // speaker drivers to the largest step at or below `g`; the input PGAs to the
 // largest step at or below `g`.  The gain set, or `None` when `g` is below the
-// path's range or the part did not take it.
+// path's range or the part did not take it, and `None` for a path the part
+// does not name: the output as a whole and the input as a whole are its paths.
 pub fn gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, path: CodecPath,
                                g: MilliDb) -> ?MilliDb [hw, mutate]
     match path
         CodecPath.CodecOutput => out_gain_set(p, c, g)
         CodecPath.CodecInput  => in_gain_set(p, c, g)
+        _                     => None
 
 fn out_gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw, mutate]
     let Some(code) = out_code(g) else return None
@@ -773,11 +776,13 @@ fn in_gain_set<P: Wm8960Port>(p: P, c: Wm8960Config, g: MilliDb) -> ?MilliDb [hw
     Some(MilliDb { mdb: in_mdb(code) })
 
 // The gain of a path as the shadow holds it, `None` while the shadow is
-// empty.  The output is the headphone volume, the input the left PGA.
+// empty, and for a path other than the output and the input.  The output is
+// the headphone volume, the input the left PGA.
 pub fn gain_get(path: CodecPath) -> ?MilliDb [mutate]
-    if path == CodecPath.CodecOutput
-        return out_gain_get()
-    in_gain_get()
+    match path
+        CodecPath.CodecOutput => out_gain_get()
+        CodecPath.CodecInput  => in_gain_get()
+        _                     => None
 
 fn out_gain_get() -> ?MilliDb [mutate]
     let v = shadow_get(R_LOUT1)

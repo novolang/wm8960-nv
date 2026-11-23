@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.1 — 2026-11-23
+
+The package asks for embedded-hal-nv ^0.4.0 (was ^0.3.3) and devices-nv ^0.4.0 (was ^0.3.3), the minor of both trait packages that the other drivers and the board packages ask for, so one version of each serves a program that takes this package beside any of them.  Under the older ranges, a program that named this package and a driver on 0.4 stopped with "no version of 'embedded-hal-nv' satisfies every requirement".
+
+No signature of the package changed.  The enums and the record of devices-nv 0.4.0 give the codec three things to answer for:
+
+- `i2s_config_of` passes the format's `slot_bits` to the board's `I2sConfig`; a format of 0 is a slot as wide as the sample, as before.
+- `fmt_code` answers -1 for the framings the interface has no code for, `AudioRightJustified`, `AudioDspA`, `AudioDspB` and `AudioPdm`, and `plan_of` and `codec_set_format` refuse them.
+- `gain_set` and `gain_get` answer `None` for the paths the part does not name: only `CodecOutput` and `CodecInput` are its paths, where `gain_get` read every path but the output as the input.
+
+`examples/playback.nv` and the suite's format helper add `slot_bits: 0` to their `AudioFormat`.
+
+The device program builds for the boards its README names, flash nrf52840-dk 14,972 B before and 14,896 B after; nrf54lm20-dk 16,404 B before and 16,344 B after; nrf52-qemu 9,796 B before and 9,800 B after.
+
 ## 0.1.0
 
 The first release: a driver for Cirrus Logic's WM8960 stereo audio codec with

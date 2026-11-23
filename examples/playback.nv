@@ -95,7 +95,7 @@ fn main() [hw, mutate]
     else
         hal.uart.write("codec reset\n")
     let f = AudioFormat { sample_rate: 44100, bit_depth: 16, channels: 2,
-                          framing: AudioFraming.AudioPhilips, codec_is_master: false }
+                          framing: AudioFraming.AudioPhilips, codec_is_master: false, slot_bits: 0 }
     if not part.codec_set_format(f)
         hal.uart.write("format refused\n")
     if not part.codec_set_power(true)
