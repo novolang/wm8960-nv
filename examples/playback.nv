@@ -81,6 +81,7 @@ fn square(var buf: Vec[i32; 256])
         var v = 8192
         if i / 50 % 2 == 1
             v = 0 - 8192
+        // 128 frames of two samples fill the 256 the buffer holds.
         let _ = buf.push(v as i32)
         let _ = buf.push(v as i32)
 

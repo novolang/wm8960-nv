@@ -1,6 +1,6 @@
 [package]
 name        = "wm8960-nv"
-version     = "0.1.1"
+version     = "0.1.2"
 description = "A driver for Cirrus Logic's WM8960 stereo audio codec with headphone and class-D speaker drivers, on an I2C control bus and a board's I2S handle: the write-only 9-bit registers kept in a shadow, the PLL from MCLK with the data sheet's fractional formula, the dividers and the audio interface, the input and output paths with the volume update and zero-cross bits, and the bias and power sequence in the data sheet's order, as devices-nv's AudioCodec."
 license     = "Apache-2.0"
 stability   = "experimental"
